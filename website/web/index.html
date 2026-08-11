@@ -3,87 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Royal Flush Poker — Play. Compete. Win.</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>Friday Night Poker — a standing invitation</title>
+  <meta name="description" content="A low-stakes home game in the back room. Doors open at seven." />
+  <!-- Inline favicon: avoids a 404 (or an SPA-fallback 200) on /favicon.ico -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%99%A0%3C/text%3E%3C/svg%3E" />
 </head>
 <body>
-  <header class="nav">
-    <div class="brand">
-      <span class="suits">♠♥♦♣</span>
-      <span class="brand-name">Royal Flush</span>
-    </div>
-    <nav>
-      <a href="#tables">Tables</a>
-      <a href="#tournaments">Tournaments</a>
-      <a href="#join">Join</a>
-    </nav>
-  </header>
-
-  <main>
-    <section class="hero">
-      <div class="hero-cards" aria-hidden="true">
-        <span class="card red">A♥</span>
-        <span class="card black">K♠</span>
-        <span class="card red">Q♦</span>
-        <span class="card black">J♣</span>
-        <span class="card red">10♥</span>
-      </div>
-      <h1>Where every hand counts.</h1>
-      <p class="tagline">
-        Join thousands of players at the felt. Cash games, sit-and-gos, and
-        weekly tournaments — all from your browser.
-      </p>
-      <a class="btn" href="#join">Join a table</a>
-    </section>
-
-    <section id="tables" class="features">
-      <h2>Live tables</h2>
-      <div class="grid">
-        <article class="feature">
-          <h3>♠ Cash Games</h3>
-          <p>Blinds from $0.01 up to high roller. Sit down and stand up any time.</p>
-        </article>
-        <article class="feature">
-          <h3>♥ Sit &amp; Go</h3>
-          <p>Single-table tournaments that start the moment the seats fill.</p>
-        </article>
-        <article class="feature">
-          <h3>♦ Fast Fold</h3>
-          <p>Fold and get instantly moved to a fresh hand at a new table.</p>
-        </article>
-      </div>
-    </section>
-
-    <section id="tournaments" class="tournaments">
-      <h2>This week's tournaments</h2>
-      <table class="schedule">
-        <thead>
-          <tr><th>Event</th><th>Buy-in</th><th>Prize pool</th><th>Starts</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>Sunday Million</td><td>$215</td><td>$1,000,000</td><td>Sun 18:00</td></tr>
-          <tr><td>Turbo Knockout</td><td>$55</td><td>$120,000</td><td>Wed 20:00</td></tr>
-          <tr><td>Freeroll Friday</td><td>Free</td><td>$5,000</td><td>Fri 21:00</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section id="join" class="join">
-      <h2>Sit down at the table</h2>
-      <p>Create your player account and grab a seat.</p>
-      <form id="join-form" autocomplete="off">
-        <input type="text" name="username" placeholder="Username" required />
-        <input type="password" name="password" placeholder="Password" required />
-        <button type="submit" class="btn">Deal me in</button>
-      </form>
-      <pre id="result" class="result" hidden></pre>
-    </section>
-  </main>
-
-  <footer>
-    <p>♠ ♥ ♦ ♣ Royal Flush Poker — a demo site for WAF testing. Play responsibly.</p>
-  </footer>
-
-  <script src="app.js"></script>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
 </body>
 </html>

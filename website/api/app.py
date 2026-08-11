@@ -1,5 +1,5 @@
 """
-Royal Flush Poker - origin API.
+Friday Night Poker - origin API.
 
 This is deliberately a permissive test origin: every route accepts every HTTP
 method and returns 200 with an echo of the request. It performs NO filtering,

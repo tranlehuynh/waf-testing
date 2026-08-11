@@ -1,17 +1,17 @@
 #!/bin/bash
 #
-# setup.sh - Install prerequisites and run the Royal Flush Poker origin website
+# setup.sh - Install prerequisites and run the Friday Night Poker origin website
 #
 #   ./setup.sh            Install Docker (if missing), then build + start (default)
 #   ./setup.sh up         Build + start in the background
 #   ./setup.sh down       Stop and remove the containers
-#   ./setup.sh restart    Restart (picks up edited static files / config)
+#   ./setup.sh restart    Rebuild + restart (picks up edited web/ or nginx/)
 #   ./setup.sh logs       Follow the container logs
 #   ./setup.sh status     Show container status
 #
 # The site listens on http://<this-server>:80 and is the ORIGIN behind your WAF.
-# Point your domain's DNS at the WAF, cert the domain with ../waf_cert.sh, have the
-# WAF forward to this server's IP:80, then scan with ../run_gotestwaf.sh.
+# Point your domain's DNS at the WAF, cert it with ../script/waf_cert.sh, have the
+# WAF forward to this server's IP:80, then scan with ../script/run_gotestwaf.sh.
 #
 set -euo pipefail
 
@@ -25,13 +25,21 @@ err()  { echo "${RED}[x]${NC} $*" >&2; }
 # ---------- Install Docker if missing (auto-detect the package manager) ----
 install_docker() {
   info "Docker not found - installing Docker Engine + compose plugin"
+  sudo -v   # prompt for the password now, not from inside a pipe later
   if command -v apt-get >/dev/null; then
+    info "Installing prerequisites (ca-certificates curl gnupg)..."
     sudo apt-get update -qq
     sudo apt-get install -y -qq ca-certificates curl gnupg
+    info "Fetching Docker's signing key from download.docker.com..."
     sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-      | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 \
+      -o /tmp/docker-key.asc https://download.docker.com/linux/ubuntu/gpg \
+      || { err "Cannot reach download.docker.com - blocked egress or a proxy is required."
+           err "Alternative: sudo apt-get install -y docker.io docker-compose-v2"; exit 1; }
+    sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg < /tmp/docker-key.asc
+    rm -f /tmp/docker-key.asc
     sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    info "Adding the Docker apt repository and installing..."
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
       | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
@@ -82,6 +90,7 @@ fi
 # ---------- Commands -----------------------------------------------------
 show_urls() {
   info "Site is up. Local check:  http://localhost/"
+  info "House rules (API page):  http://localhost/rules"
   info "API health:              http://localhost/api/health"
   echo
   warn "Reminder: run GoTestWAF against your WAF domain (https://<domain>), not"
@@ -100,8 +109,10 @@ case "${1:-up}" in
     $COMPOSE down
     ;;
   restart)
-    info "Restarting containers..."
-    $COMPOSE restart
+    # The React app is baked into the web image, so edits need a rebuild -
+    # a plain 'compose restart' would serve the previous build.
+    info "Rebuilding and restarting containers..."
+    $COMPOSE up -d --build
     $COMPOSE ps
     ;;
   logs)
@@ -111,11 +122,11 @@ case "${1:-up}" in
     $COMPOSE ps
     ;;
   -h|--help)
-    sed -n '2,17p' "$0" | sed 's/^# \?//'
+    sed -n '2,15p' "$0" | sed 's/^# \?//'
     ;;
   *)
     err "Unknown command: $1"
-    sed -n '2,17p' "$0" | sed 's/^# \?//'
+    sed -n '2,15p' "$0" | sed 's/^# \?//'
     exit 1
     ;;
 esac

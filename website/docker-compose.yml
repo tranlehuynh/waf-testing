@@ -6,12 +6,11 @@ services:
     restart: unless-stopped
 
   web:
-    image: nginx:alpine
+    build: ./web        # builds the React app, then serves it with nginx
     ports:
       - "80:80"         # the origin port your WAF forwards to
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./web:/usr/share/nginx/html:ro
     depends_on:
       - api
     restart: unless-stopped
