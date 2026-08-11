@@ -1,0 +1,14 @@
+{
+  // Editor
+  "editor.fontFamily": "Monaco",
+  "editor.fontSize": 14,
+
+  // Chat
+  "chat.fontFamily": "Monaco",
+
+  // Source Control
+  "scm.inputFontFamily": "Monaco",
+
+  // Files
+  "files.autoSave": "afterDelay"
+}
