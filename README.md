@@ -7,6 +7,7 @@ Helper scripts and a demo origin site for working with a WAF-fronted domain:
 | [`script/run_gotestwaf.sh`](script/run_gotestwaf.sh) | Run a Wallarm **GoTestWAF** scan against a target URL to measure how well its WAF blocks attack payloads. |
 | [`script/waf_cert.sh`](script/waf_cert.sh) | Issue / auto-renew **Let's Encrypt** certificates (DNS-01 via acme.sh) and export them (PEM + PKCS#12) for a WAF appliance. |
 | [`website/`](website/) | A demo poker site (nginx + Flask API) to run **behind your WAF** as the origin/target for GoTestWAF. See [`website/README.md`](website/README.md). |
+| [`docs/waf-test-report.md`](docs/waf-test-report.md) | Findings report for the scan of `superman.chubbyduck.org` — corrected scores, bypasses by attack class, and the remediation asks for the WAF operator. |
 
 Detailed reference: [`docs/WAF.md`](docs/WAF.md).
 
@@ -63,7 +64,7 @@ bypasses and reports a false-positive rate.
 | `--url URL` | Target URL (prompted if omitted) | — |
 | `--waf-name NAME` | Label shown in the report | `unknown-waf` |
 | `--block-codes LIST` | Status codes meaning "blocked" | `403` |
-| `--pass-codes LIST` | Status codes meaning "not blocked" | `200,404` |
+| `--pass-codes LIST` | Status codes meaning "not blocked" | `200` |
 | `--workers N` | Parallel workers | `5` |
 | `--strict` | Count anything that is neither a pass nor a block code as **BLOCKED** | off |
 | `--skip-precheck` | Skip the benign-request sanity check | off |

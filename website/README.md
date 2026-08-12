@@ -10,11 +10,16 @@ Two pages:
 | --- | --- |
 | `/` | Landing page. Content only — **no API calls at all**. |
 | `/rules` | House rules. Carries all the request traffic: a search that sends the payload in the **URL query** (`GET /api/rules?q=…`) and a note box that sends it in the **request body** (`POST /api/notes`). Each shows the status code and the raw origin response, so you can see whether the WAF blocked a payload or the origin echoed it back. |
-| anything else | Not-found page, served with a **real `404`** status. |
+| anything else | Handed to the Flask app, which answers **`200`** with a JSON echo. |
 
 The two real routes are listed twice — as `ROUTES` in `web/src/App.jsx` and as exact-match
-`location` blocks in `nginx/default.conf`. **Add a new page to both**, or nginx will 404 a
-route the app knows about.
+`location` blocks in `nginx/default.conf`. **Add a new page to both**, or nginx will hand
+a route the app knows about to the API instead of serving the app shell.
+
+> Unknown paths deliberately return `200`, not `404`. GoTestWAF puts payloads in the URL
+> path, and a `404` there is scored as "not blocked" even though the payload never reached
+> an application — so the origin answers every path. The consequence is that the SPA's
+> styled Not Found page is now reached only by in-app navigation.
 
 ## Where it fits
 
@@ -57,8 +62,10 @@ Then check locally:
 ```bash
 curl -s http://localhost/       | grep -o '<div id="root">'   # app shell
 curl -so /dev/null -w '%{http_code}\n' http://localhost/rules # 200 — a real route
-curl -so /dev/null -w '%{http_code}\n' http://localhost/nope  # 404 — not-found page
-curl -s http://localhost/api/health                           # {"status":"ok"}
+curl -so /dev/null -w '%{http_code}\n' http://localhost/nope  # 200 — handed to the API
+curl -so /dev/null -w '%{http_code}\n' -X POST -d a=1 http://localhost/  # 200 — body read
+curl -s http://localhost/api/health                           # {"status":"ok","build":"real-1"}
+curl -s 'http://localhost/api/reports/download?file=../../../../etc/passwd'  # REAL file read (sink container)
 ```
 
 ## API endpoints
@@ -74,12 +81,71 @@ return `200` with a JSON echo of the request:
 | `/api/tables` | Live tables resource |
 | `/api/games` | Games resource |
 | `/api/login` | Login resource |
-| `/api/health` | `GET` only → `{"status":"ok"}` |
+| `/api/health` | `{"status":"ok","build":"…"}` — the `build` is the deployed-version check |
 | `/api/<anything>` | Catch-all → `200` echo, so any path/method the WAF test throws lands on the origin |
 
 `/api/rules` and `/api/notes` need no code in `api/app.py` — the catch-all route already
 returns a `200` echo for any `/api/*` path. There is no datastore: posting a note echoes
 it back, and the site appends it client-side only.
+
+### Real attack surface (detonation chamber)
+
+`api/sinks.py` recognises an attack payload in any query value, header, URL path or
+request body and — for a recognised attack — **actually executes it against fake data**,
+then adds an `attack` block (`executed: true`, `contained: true`, plus the real `result`)
+to the response. This is what turns a GoTestWAF *bypass* into a confirmed compromise:
+a shell payload runs in a real shell, `../` reads a real file, SQL hits a real SQLite DB,
+a template renders in real Jinja2, XML resolves real external entities.
+
+It exists because GoTestWAF derives its verdict from the HTTP status code alone. Without
+it a report can only say "the WAF returned 200"; with it, each unblocked payload is tied
+to a named feature **and proven impact**. The status code stays `200` either way, so the
+scan score is unchanged.
+
+**Where execution happens — and why it is safe.** Attacker input never runs in the `api`
+process. It is POSTed to a separate `sink` service that is deliberately vulnerable but
+contained by deployment (see the `networks` and `sink` hardening in `docker-compose.yml`):
+
+- `sink` and `mongo` sit only on the `detonation` network (`internal: true`) — **no route
+  to the internet, the LAN, or the host**, so even genuine RCE there cannot phone home or
+  pivot.
+- `sink` runs non-root, all Linux capabilities dropped, `no-new-privileges`, read-only
+  root filesystem, with process/memory caps. Every code-exec payload runs as a subprocess
+  with a 2s timeout and rlimits.
+- Only fake, randomly-seeded data lives there (`sink/seed.py`): random players, a planted
+  fake `/etc/passwd` and `db.conf`, a fake directory.
+
+The one exception is **Log4Shell/JNDI**: the outbound OOB callback fires from `api` (which
+has egress), and only to a host matching the `JNDI_CALLBACK_ALLOW` env var — set it to your
+own collaborator suffix. Left empty (the default), JNDI is detected and logged but no
+outbound call is made, so a scan does not blast third-party OOB domains.
+
+> **Operator hardening (recommended):** because these sinks genuinely execute, firewall
+> this origin's port 80 to accept traffic **only from your WAF's egress IPs**. Origin IPs
+> are often discoverable, and a payload that reaches the origin directly skips the very WAF
+> you are testing.
+
+These paths advertise a sink even for benign input. GoTestWAF itself never visits them —
+it sends everything to the base URL — so they are for the report's reproduction commands
+and for targeted scans (`--url https://your-domain/api/players/search`):
+
+| Endpoint | Parameters | Models |
+| --- | --- | --- |
+| `/api/reports/download` | `file`, `path` | path traversal / local file read |
+| `/api/players/search` | `q`, `handle` | SQL injection |
+| `/api/tools/ping` | `host` | OS command injection |
+| `/api/templates/preview` | `tpl`, `name` | server-side template injection |
+| `/api/import/feed` | XML body | XXE / XML injection |
+
+Every request also writes one JSON line to stdout with the payload, the classified
+category and a request id, which is what proves a payload reached the application:
+
+```bash
+docker compose logs --no-color api | grep '^{' > evidence.jsonl
+```
+
+One behavioural note: the app reads the raw request body before Flask parses it, so a
+form-encoded body appears in the echo as the raw string rather than a parsed dict.
 
 Example:
 
@@ -100,8 +166,13 @@ web/     React app (Vite) + Dockerfile — built, then served by nginx
   src/styles.css        design tokens + all styles
   src/pages/Home.jsx    landing page (no API calls)
   src/pages/Rules.jsx   house rules + the two API targets
-api/     Flask app + Dockerfile (the API backend)
+api/     Flask app + Dockerfile (the API backend / orchestrator)
+  app.py                routes, request classification, evidence log
+  sinks.py              payload classifier + dispatch to the sink; scoped JNDI callback
+sink/    Detonation chamber + Dockerfile — the real, contained vulnerable backends
+  sink_app.py           per-category handlers that actually execute the payload
+  seed.py               fake, randomly-seeded data (players DB, files, directory)
 nginx/   default.conf — serves the built app, proxies /api/ to the api service
-docker-compose.yml   web (build) + api (Flask)
+docker-compose.yml   web + api (edge) · sink + mongo (detonation, internal:true, no egress)
 setup.sh             install Docker + run/maintain the stack
 ```

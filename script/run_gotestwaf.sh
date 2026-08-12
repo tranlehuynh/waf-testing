@@ -8,7 +8,10 @@ IMAGE="wallarm/gotestwaf"
 TARGET_URL=""
 WAF_NAME="unknown-waf"
 BLOCK_CODES="403"
-PASS_CODES="200,404"
+# 200 only. The origin website answers 200 for every path and method, so a 404 can now
+# only come from the WAF or an intermediary - counting it as "not blocked" would score a
+# payload as a bypass when it never reached the application at all.
+PASS_CODES="200"
 WORKERS="5"
 IDLE_CONNS="5"
 STRICT=0
@@ -36,7 +39,7 @@ Options:
                          Without one, the script probes http then https.
   --waf-name NAME        Label shown in the report            (default: unknown-waf)
   --block-codes LIST     Status codes that mean "blocked"     (default: 403)
-  --pass-codes LIST      Status codes that mean "not blocked" (default: 200,404)
+  --pass-codes LIST      Status codes that mean "not blocked" (default: 200)
   --workers N            Parallel workers                     (default: 5)
   --idle-conns N         Max idle connections                 (default: 5)
   --strict               Count anything that is neither a pass nor a block code
@@ -208,64 +211,120 @@ done
 
 # ---------- 5. Sanity-check the target ----------------------------------
 if [[ "$DO_PRECHECK" -eq 1 ]]; then
-  hr; info "[4/6] Pre-flight check on benign requests"; hr
-  echo "A clean request must NOT return a block code, and ideally should return"
-  echo "a pass code - otherwise the false-positive score is meaningless."
+  hr; info "[4/6] Pre-flight check on the target"; hr
+  echo "Every probe must return a code in --block-codes or --pass-codes. Anything else"
+  echo "is 'unresolved', and --nonBlockedAsPassed then silently files it as a bypass"
+  echo "(or, for benign input, as a false positive) that the WAF never actually produced."
   echo
-  UNLISTED=0; REDIRECTS=0; FALSE_POS=0
-  for path in "/" "/index.html" "/?q=hello%20world" "/?name=Nguyen%20Van%20A" "/no-such-path-9f3a2b"; do
+  UNLISTED=0; REDIRECTS=0; FALSE_POS=0; UNSCOREABLE=()
+
+  # probe <pass|scoreable> <label> <curl args...>
+  #   pass      - benign traffic; a block code here is a false positive
+  #   scoreable - a payload shape; blocked or passed are both legitimate outcomes,
+  #               anything else means GoTestWAF cannot score that whole placeholder
+  probe() {
+    local mode="$1" label="$2"; shift 2
+    local code
     # No -L: a redirect must stay visible instead of being followed away.
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${TARGET_URL}${path}" || echo "ERR")
-    printf '    %-30s -> %s' "$path" "$code"
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "$@" || echo "ERR")
+    printf '    %-34s -> %s' "$label" "$code"
     if [[ ",${BLOCK_CODES}," == *",${code},"* ]]; then
-      echo "  ${RED}<- counted as BLOCKED (false positive)${NC}"; FALSE_POS=1
+      if [[ "$mode" == "pass" ]]; then
+        echo "  ${RED}<- counted as BLOCKED (false positive)${NC}"; FALSE_POS=1
+      else
+        echo "  ${GRN}<- blocked${NC}"
+      fi
     elif [[ ",${PASS_CODES}," == *",${code},"* ]]; then
       echo "  ${GRN}<- pass${NC}"
     elif [[ "$code" =~ ^3[0-9][0-9]$ ]]; then
       echo "  ${YEL}<- redirect${NC}"; REDIRECTS=1; UNLISTED=1
     else
-      echo "  ${YEL}<- not in either list${NC}"; UNLISTED=1
+      echo "  ${YEL}<- UNSCOREABLE${NC}"; UNLISTED=1; UNSCOREABLE+=("${label} -> ${code}")
     fi
-  done
-  echo
+  }
+
   echo "Block codes: ${BLOCK_CODES}   |   Pass codes: ${PASS_CODES}"
   echo
+  info "Benign requests - a block code here is a false positive"
+  probe pass "GET /"                    "${TARGET_URL}/"
+  probe pass "GET /?q=hello world"      "${TARGET_URL}/?q=hello%20world"
+  probe pass "GET /?name=Nguyen Van A"  "${TARGET_URL}/?name=Nguyen%20Van%20A"
+  probe pass "GET /no-such-path-9f3a2b" "${TARGET_URL}/no-such-path-9f3a2b"
+  echo
 
-  # Large bodies are the usual cause of "unexpected EOF" during a scan.
-  info "Probing the request body limit (~70 KB POST)"
-  BIG=$(head -c 70000 /dev/zero | tr '\0' 'A')
-  big_code=$(printf '%s' "$BIG" \
-    | curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
-        -X POST -H 'Content-Type: text/plain' --data-binary @- "${TARGET_URL}/" \
-    || echo "ERR")
-  if [[ "$big_code" == "ERR" || -z "$big_code" || "$big_code" == "000" ]]; then
-    warn "Large POST dropped the connection. The 8kb-128kb test cases will fail"
-    warn "the same way. Raise client_max_body_size / SecRequestBodyLimit first."
-  elif [[ "$big_code" =~ ^(404|405|501)$ ]]; then
-    # A method/path rejection happens BEFORE the body is read, so this proves
-    # nothing about the body limit - reporting it as "fine" is a false all-clear.
-    # Static roots answer 405 to any POST, so retry somewhere that accepts one.
-    warn "Large POST to / returned ${big_code} (method/path refused before the body was"
-    warn "read) - retrying against /api/ to actually exercise the body limit..."
-    big_code=$(printf '%s' "$BIG" \
-      | curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
-          -X POST -H 'Content-Type: text/plain' --data-binary @- "${TARGET_URL}/api/players" \
-      || echo "ERR")
-    if [[ "$big_code" == "ERR" || -z "$big_code" || "$big_code" == "000" ]]; then
-      warn "/api/ dropped the 70 KB body. The 8kb-128kb test cases will fail the same"
-      warn "way with 'unexpected EOF'. Raise the WAF's request-body inspection limit"
-      warn "(and client_max_body_size / SecRequestBodyLimit) before trusting those rows."
-    elif [[ "$big_code" =~ ^(404|405|501)$ ]]; then
-      warn "/api/ also returned ${big_code} - no POST-capable path found, so the body"
-      warn "limit remains untested. The 8kb-128kb cases may still fail."
-    else
-      info "Large POST to /api/ returned ${big_code} - body size looks fine"
-    fi
+  # One probe per placeholder GoTestWAF uses. It sends body payloads to the base URL, so
+  # these mirror the real requests. A 405 or 404 here is the failure that cost two
+  # earlier scans ~40% of their test cases without a single warning in the report.
+  info "Payload shapes - each must be scoreable"
+  probe scoreable "POST / urlencoded (HTMLForm)" -X POST -d 'q=hello' "${TARGET_URL}/"
+  probe scoreable "POST / json (JSONRequest)"    -X POST -H 'Content-Type: application/json' \
+                                                 -d '{"q":"hello"}' "${TARGET_URL}/"
+  probe scoreable "POST / xml (XMLBody/SOAPBody)" -X POST -H 'Content-Type: text/xml' \
+                                                 -d '<q>hello</q>' "${TARGET_URL}/"
+  probe scoreable "POST / multipart"             -X POST -F 'q=hello' "${TARGET_URL}/"
+  probe scoreable "PUT /"                        -X PUT -d 'q=hello' "${TARGET_URL}/"
+  probe scoreable "PATCH /"                      -X PATCH -d 'q=hello' "${TARGET_URL}/"
+  probe scoreable "DELETE /"                     -X DELETE "${TARGET_URL}/"
+  probe scoreable "OPTIONS /"                    -X OPTIONS "${TARGET_URL}/"
+  probe scoreable "GET /payload-in-url-path"     "${TARGET_URL}/payload-in-url-path"
+  echo
+
+  # Prove the request reached the instrumented origin. Without this the scan can still
+  # produce a score, but no finding can show that a payload arrived at the application.
+  info "Checking which origin build answers"
+  ORIGIN_BUILD=$(curl -sk -D - -o /dev/null --max-time 10 "${TARGET_URL}/?fnp_canary=1" 2>/dev/null \
+    | tr -d '\r' | awk 'tolower($1)=="x-origin-build:"{print $2}' | tail -1)
+  if [[ -z "$ORIGIN_BUILD" ]]; then
+    # Some WAFs strip unknown response headers, so try the body instead.
+    ORIGIN_BUILD=$(curl -sk --max-time 10 "${TARGET_URL}/api/health" 2>/dev/null \
+      | sed -n 's/.*"build"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  fi
+  if [[ -n "$ORIGIN_BUILD" ]]; then
+    info "Origin build: ${ORIGIN_BUILD}"
   else
-    info "Large POST returned ${big_code} - body size looks fine"
+    warn "No X-Origin-Build header and no build in /api/health. Either the origin is not"
+    warn "running the instrumented app, or the WAF strips both. Findings will then lack"
+    warn "the per-request evidence that proves a payload reached the application."
   fi
   echo
 
+  # Large bodies are the usual cause of "unexpected EOF" during a scan. A status code
+  # alone cannot tell "accepted" from "read": the origin echoes how many bytes it
+  # actually received, so assert on that instead of trusting a 200.
+  info "Probing the request body limit (~70 KB POST)"
+  BIG=$(head -c 70000 /dev/zero | tr '\0' 'A')
+  BIG_RESPONSE=$(printf '%s' "$BIG" \
+    | curl -sk -w '\n%{http_code}' --max-time 15 \
+        -X POST -H 'Content-Type: text/plain' --data-binary @- "${TARGET_URL}/" \
+    || printf '\nERR')
+  big_code="${BIG_RESPONSE##*$'\n'}"
+  big_body="${BIG_RESPONSE%$'\n'*}"
+  if [[ "$big_code" == "ERR" || -z "$big_code" || "$big_code" == "000" ]]; then
+    warn "Large POST dropped the connection. The 8kb-128kb test cases will fail the same"
+    warn "way and be recorded as 'failed' - neither blocked nor passed. Raise the WAF's"
+    warn "request-body inspection limit (and client_max_body_size / SecRequestBodyLimit)."
+  elif [[ ",${BLOCK_CODES}," == *",${big_code},"* ]]; then
+    info "Large POST returned ${big_code} - the WAF blocked it, which is a real result"
+  elif grep -q '"body_len":70000' <<<"$big_body"; then
+    info "Large POST returned ${big_code} and the origin read all 70000 bytes"
+  else
+    warn "Large POST returned ${big_code}, but the origin did not report reading 70000"
+    warn "bytes. Something between here and the application truncates or discards the"
+    warn "body, so the 8kb-128kb rows will describe that rather than the WAF."
+  fi
+  echo
+
+  if ((${#UNSCOREABLE[@]})); then
+    warn "UNSCOREABLE shapes - no payload GoTestWAF sends this way can be scored:"
+    for shape in "${UNSCOREABLE[@]}"; do warn "    ${shape}"; done
+    warn "Two causes, needing different fixes:"
+    warn "  1. The origin is stale or misconfigured. On server A run ./setup.sh restart"
+    warn "     (a full rebuild), then re-run this. Its nginx must hand every method and"
+    warn "     every unknown path to the app instead of answering 404/405 itself."
+    warn "  2. The WAF enforces an HTTP-method policy. Send the same request straight to"
+    warn "     the origin IP with a Host: header - if the origin answers 200 and the WAF"
+    warn "     answers 405, fix it in the WAF or add 405 to --block-codes deliberately."
+  fi
   if [[ "$REDIRECTS" -eq 1 ]]; then
     warn "The target redirects. Every attack payload will be scored as BYPASSED"
     warn "because a 3xx is neither a block nor a pass code. Scan the final"
@@ -312,7 +371,7 @@ DOCKER_ARGS=(
   --workers="$WORKERS"
   --maxIdleConns="$IDLE_CONNS"
   "${OPTIONAL_FLAGS[@]}"
-  --reportFormat=html,json
+  --reportFormat=html,json,csv
   --reportPath=/app/reports
 )
 

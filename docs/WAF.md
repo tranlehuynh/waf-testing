@@ -30,7 +30,7 @@ many the WAF blocks vs. bypasses, and its false-positive rate.
 | `--url URL` | Target URL (prompted if omitted) | — |
 | `--waf-name NAME` | Label shown in the report | `unknown-waf` |
 | `--block-codes LIST` | Status codes meaning "blocked" | `403` |
-| `--pass-codes LIST` | Status codes meaning "not blocked" | `200,404` |
+| `--pass-codes LIST` | Status codes meaning "not blocked" | `200` |
 | `--workers N` | Parallel workers | `5` |
 | `--strict` | Count anything that is neither a pass nor a block code as **BLOCKED** (GoTestWAF's own default) | off |
 | `--skip-precheck` | Skip the benign-request sanity check | off |
@@ -44,7 +44,28 @@ drives the false-positive score to 0% and inflates the results. Use `--strict` o
 you deliberately want that stricter behaviour — and make sure benign paths return a
 listed pass code first (the pre-flight check reports this).
 
-Reports are written to `reports/<timestamp>/` as HTML + JSON.
+`--nonBlockedAsPassed` cuts the other way too: an unlisted status is folded into *passed*
+for attack payloads and into *blocked* for benign ones, and the summary still prints
+`unresolved: 0`. So a target that answers `405` to body-borne requests produces a report
+full of bypasses and false positives that the WAF never caused. The pre-flight check
+probes every placeholder shape for exactly this reason — do not skip it.
+
+Reports are written to `reports/<timestamp>/` as HTML + JSON + CSV. A worked analysis of a
+real scan, including how to correct for the above, is in
+[`waf-test-report.md`](waf-test-report.md).
+
+### Confirming a bypass is real
+
+GoTestWAF's verdict is only the status code: a `200` means "the WAF let it through", not
+"the attack worked". The bundled origin (`../website/`) closes that gap — for a recognised
+payload it **actually executes** the attack against fake data (real shell, SQLite, Jinja2,
+file read, XML entities) and returns the real result in the response's `attack` block,
+while still answering `200` so the score is unchanged. So a row marked *bypassed* can be
+reproduced against the origin to see the concrete impact. The execution is contained: it
+runs in a separate, non-root, **no-egress** `sink` container on an `internal: true` network
+and touches only fake data. See [`../website/README.md`](../website/README.md#real-attack-surface-detonation-chamber)
+for the sink details, the `JNDI_CALLBACK_ALLOW` switch for Log4Shell, and the recommended
+step of firewalling the origin to your WAF's egress IPs.
 
 > The script auto-installs Docker CE on Ubuntu if missing and falls back to
 > `sudo docker` when the daemon isn't reachable in the current session.

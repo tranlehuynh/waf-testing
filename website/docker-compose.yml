@@ -1,9 +1,40 @@
+# A scan is thousands of requests with bodies up to 128 KB, and the api service writes
+# a JSON evidence line per request. Docker's json-file driver is unbounded by default,
+# so both services get an explicit cap - otherwise a few scans fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Two networks are the load-bearing safety boundary. `edge` carries public traffic and
+# has normal internet egress. `detonation` has internal:true, so Docker sets up NO NAT to
+# the outside: containers whose ONLY network is `detonation` cannot reach the internet,
+# the LAN, or the host. `sink` and `mongo` live only there, so even genuine RCE inside the
+# sink cannot phone home or pivot. `api` bridges both, but it runs only our trusted code
+# (it does not forward packets), so it is not a usable router out of `detonation`.
+networks:
+  edge:
+  detonation:
+    internal: true
+
 services:
   api:
     build: ./api
     expose:
       - "5000"          # internal only; nginx reaches it over the compose network
+    environment:
+      SINK_URL: "http://sink:5001/run"
+      # Set to your own collaborator domain suffix (e.g. "abc123.oast.me") to enable the
+      # real Log4Shell OOB callback. Empty = detect + log JNDI, but make no outbound call.
+      JNDI_CALLBACK_ALLOW: ""
+    networks:
+      - edge
+      - detonation
+    depends_on:
+      - sink
     restart: unless-stopped
+    logging: *logging
 
   web:
     build: ./web        # builds the React app, then serves it with nginx
@@ -14,4 +45,46 @@ services:
       - ./acme-challenge:/var/www/acme:ro   # Let's Encrypt challenge files (../script/waf_cert.sh)
     depends_on:
       - api
+    networks:
+      - edge
     restart: unless-stopped
+    logging: *logging
+
+  # The detonation chamber: deliberately vulnerable, safe only by containment.
+  # No published port, no egress, non-root, all caps dropped, read-only rootfs (payloads
+  # get a tmpfs /tmp to work in), process and memory capped. Only fake data lives here.
+  sink:
+    build: ./sink
+    environment:
+      MONGO_URL: "mongodb://mongo:27017"
+    networks:
+      - detonation
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    depends_on:
+      - mongo
+    restart: unless-stopped
+    logging: *logging
+
+  # Real document store for genuine NoSQL injection ($where server-side JS). Fake data,
+  # ephemeral (tmpfs), no egress. Drop this service and the sink falls back to an
+  # in-process operator evaluator (auth-bypass demo without $where).
+  mongo:
+    image: mongo:6
+    command: ["--bind_ip_all"]
+    networks:
+      - detonation
+    tmpfs:
+      - /data/db
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging: *logging
