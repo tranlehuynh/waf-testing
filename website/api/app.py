@@ -63,6 +63,17 @@ def catch_all(subpath):
     return echo(subpath)
 
 
+# ---- Site paths that nginx cannot serve statically ----------------------
+# nginx hands POST/PUT/DELETE/... on the static site over here (error_page 405
+# -> @app), because its static handler would answer 405 without reading the
+# body. Answering 200 keeps the origin uniformly permissive, so a GoTestWAF
+# result reflects the WAF rather than the origin's method handling.
+@app.route("/", methods=ALL_METHODS)
+@app.route("/<path:subpath>", methods=ALL_METHODS)
+def site_catch_all(subpath=""):
+    return echo(subpath or "site")
+
+
 if __name__ == "__main__":
     # Dev only; in the container gunicorn serves the app (see Dockerfile).
     app.run(host="0.0.0.0", port=5000)

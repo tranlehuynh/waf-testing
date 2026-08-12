@@ -244,9 +244,23 @@ if [[ "$DO_PRECHECK" -eq 1 ]]; then
   elif [[ "$big_code" =~ ^(404|405|501)$ ]]; then
     # A method/path rejection happens BEFORE the body is read, so this proves
     # nothing about the body limit - reporting it as "fine" is a false all-clear.
-    warn "Large POST returned ${big_code}: the endpoint rejected the METHOD or PATH, so"
-    warn "the body limit was never exercised. The 8kb-128kb cases may still fail with"
-    warn "'unexpected EOF'. Re-probe against a path that accepts POST (e.g. /api/)."
+    # Static roots answer 405 to any POST, so retry somewhere that accepts one.
+    warn "Large POST to / returned ${big_code} (method/path refused before the body was"
+    warn "read) - retrying against /api/ to actually exercise the body limit..."
+    big_code=$(printf '%s' "$BIG" \
+      | curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
+          -X POST -H 'Content-Type: text/plain' --data-binary @- "${TARGET_URL}/api/players" \
+      || echo "ERR")
+    if [[ "$big_code" == "ERR" || -z "$big_code" || "$big_code" == "000" ]]; then
+      warn "/api/ dropped the 70 KB body. The 8kb-128kb test cases will fail the same"
+      warn "way with 'unexpected EOF'. Raise the WAF's request-body inspection limit"
+      warn "(and client_max_body_size / SecRequestBodyLimit) before trusting those rows."
+    elif [[ "$big_code" =~ ^(404|405|501)$ ]]; then
+      warn "/api/ also returned ${big_code} - no POST-capable path found, so the body"
+      warn "limit remains untested. The 8kb-128kb cases may still fail."
+    else
+      info "Large POST to /api/ returned ${big_code} - body size looks fine"
+    fi
   else
     info "Large POST returned ${big_code} - body size looks fine"
   fi
