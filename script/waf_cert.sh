@@ -1,9 +1,10 @@
 #!/bin/bash
 #
-# waf_cert.sh - Issue / renew Let's Encrypt certs via DNS-01 (acme.sh in Docker) and export them for a WAF
+# waf_cert.sh - Issue / renew Let's Encrypt certs (acme.sh in Docker) and export them for a WAF
 #
 #   ./waf_cert.sh install                 Pull the acme.sh image + start the auto-renew container
 #   ./waf_cert.sh issue  [domain]         Issue cert(s) for the first time (all, or one)
+#   ./waf_cert.sh continue <domain>       VALIDATION=dns-manual only: finish after adding the TXT record
 #   ./waf_cert.sh show   [domain]         Print private key + fullchain (paste into WAF UI)
 #   ./waf_cert.sh renew  [domain]         Force a renewal now (normally the container handles this)
 #   ./waf_cert.sh export [domain]         Re-export the files and re-arm the after-renewal hook
@@ -36,12 +37,24 @@ declare -A EXTRA_SANS=(
 
 EMAIL="you@example.com"
 
-DNS_API="dns_cf"                     # shared across all domains (same provider account)
+# How Let's Encrypt verifies you own the domain. It never talks to your WAF - it only
+# checks the DOMAIN, so a custom/self-built WAF is fine. Pick whichever you can do:
+#
+#   dns-api     acme.sh adds the TXT record itself through your DNS host's API.
+#               Needs DNS_API + credentials below. Only mode with automatic renewal.
+#   dns-manual  acme.sh prints a TXT record and you add it by hand in any DNS panel.
+#               Works with ANY DNS host, no API needed. You must repeat it every 90 days.
+#   http        Let's Encrypt fetches a file from THIS server over port 80.
+#               No DNS credentials at all, but the domain must resolve to this box and
+#               port 80 must be free and reachable from the internet. Renews automatically.
+VALIDATION="dns-api"
+
+DNS_API="dns_cf"                     # VALIDATION=dns-api only - which DNS host's API to use
                                      # dns_cf=Cloudflare, dns_aws=Route53,
                                      # dns_gd=GoDaddy, dns_namecheap...
                                      # see: ./waf_cert.sh -- --dnshelp
 
-# DNS provider credentials (fill in only the lines matching DNS_API above)
+# DNS provider credentials (VALIDATION=dns-api only; fill in the lines matching DNS_API)
 export CF_Token=""                   # Cloudflare API token (Zone:DNS:Edit)
 export CF_Account_ID=""
 # export AWS_ACCESS_KEY_ID=""
@@ -68,21 +81,42 @@ if [[ "$KEY_LENGTH" == ec-* ]]; then ECC=(--ecc); else ECC=(); fi
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { echo "[$(date '+%F %T')] ERROR: $*" >&2; exit 1; }
 
-# --- Which -e flags to forward to the container (values stay out of the process list) ---
-cred_env() {
-  case "$DNS_API" in
-    dns_cf)
-      [[ -n "${CF_Token:-}" ]] || die "CF_Token is empty - set your Cloudflare API token in the config block."
-      CRED_ENV=(-e CF_Token -e CF_Account_ID)
+# --- Translate VALIDATION into acme.sh flags + docker run options ---------
+# Only 'issue'/'continue' need this; every other command reads state from the volume.
+CRED_ENV=()      # -e flags forwarded to the container (values stay out of the process list)
+RUN_OPTS=()      # extra docker run options
+ISSUE_ARGS=()    # how acme.sh should validate
+
+setup_validation() {
+  case "$VALIDATION" in
+    dns-api)
+      case "$DNS_API" in
+        dns_cf)
+          [[ -n "${CF_Token:-}" ]] || die "CF_Token is empty - set your Cloudflare API token in the config block, or switch VALIDATION to dns-manual/http."
+          CRED_ENV=(-e CF_Token -e CF_Account_ID)
+          ;;
+        dns_aws)
+          [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] \
+            || die "AWS credentials are empty - set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY."
+          CRED_ENV=(-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY)
+          ;;
+        *)
+          log "Note: cannot pre-validate credentials for '$DNS_API' - relying on acme.sh to report errors."
+          ;;
+      esac
+      ISSUE_ARGS=(--dns "$DNS_API")
       ;;
-    dns_aws)
-      [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] \
-        || die "AWS credentials are empty - set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY."
-      CRED_ENV=(-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY)
+    dns-manual)
+      ISSUE_ARGS=(--dns --yes-I-know-dns-manual-mode-enough-go-ahead-please)
+      ;;
+    http)
+      # acme.sh serves the challenge itself on port 80, so the port must be published
+      # and free (stop anything already bound to 80 first).
+      ISSUE_ARGS=(--standalone)
+      RUN_OPTS=(-p 80:80)
       ;;
     *)
-      log "Note: cannot pre-validate credentials for '$DNS_API' - relying on acme.sh to report errors."
-      CRED_ENV=()
+      die "VALIDATION must be dns-api, dns-manual or http (got '$VALIDATION')."
       ;;
   esac
 }
@@ -95,9 +129,8 @@ check_docker() {
 
 # --- Run acme.sh in a throw-away container (state comes from the volume) --------
 acme() {
-  cred_env
   mkdir -p "$OUT_BASE"; chmod 700 "$OUT_BASE"
-  $DOCKER run --rm \
+  $DOCKER run --rm "${RUN_OPTS[@]}" \
     -v "${VOLUME}:/acme.sh" \
     -v "${OUT_BASE}:/out" \
     "${CRED_ENV[@]}" \
@@ -107,7 +140,6 @@ acme() {
 # --- Install: no packages, no host cron - just an image, a volume and a container ---
 cmd_install() {
   check_docker
-  cred_env
 
   log "Pulling ${IMAGE}..."
   $DOCKER pull "$IMAGE"
@@ -116,15 +148,22 @@ cmd_install() {
   mkdir -p "$OUT_BASE"; chmod 700 "$OUT_BASE"
 
   # The image ships busybox crond; 'daemon' runs acme.sh's daily renewal check inside
-  # the container, so the host needs no cron package at all.
+  # the container, so the host needs no cron package at all. No credentials are passed
+  # here on purpose - acme.sh stores them in the volume during 'issue' and reuses them.
+  # http validation renews by serving the challenge itself, so the daemon needs port 80 too
+  local daemon_opts=()
+  if [[ "$VALIDATION" == "http" ]]; then daemon_opts=(-p 80:80); fi
+
   $DOCKER rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  $DOCKER run -d --name "$CONTAINER" --restart unless-stopped \
+  $DOCKER run -d --name "$CONTAINER" --restart unless-stopped "${daemon_opts[@]}" \
     -v "${VOLUME}:/acme.sh" \
     -v "${OUT_BASE}:/out" \
-    "${CRED_ENV[@]}" \
     "$IMAGE" daemon >/dev/null
 
   log "Done. State lives in volume '${VOLUME}', renewals run in container '${CONTAINER}'."
+  if [[ "$VALIDATION" == "dns-manual" ]]; then
+    log "VALIDATION=dns-manual: renewals are NOT automatic, you re-run issue/continue by hand."
+  fi
   log "Next: $0 issue"
 }
 
@@ -132,16 +171,37 @@ cmd_install() {
 cmd_issue() {
   local domain="$1"
   check_docker
+  setup_validation
 
   local args=(-d "$domain")
   # Append any extra SANs configured for this domain
   local extra="${EXTRA_SANS[$domain]:-}"
   for d in $extra; do [[ -n "$d" ]] && args+=(-d "$d"); done
 
-  log "Requesting certificate for: ${domain} ${extra}"
-  acme --issue --dns "$DNS_API" "${args[@]}" --keylength "$KEY_LENGTH" --server letsencrypt -m "$EMAIL"
+  log "Requesting certificate for: ${domain} ${extra} (validation: ${VALIDATION})"
 
+  if [[ "$VALIDATION" == "dns-manual" ]]; then
+    # Manual mode is a two-step dance: this run only PRINTS the TXT record to add.
+    acme --issue "${ISSUE_ARGS[@]}" "${args[@]}" --keylength "$KEY_LENGTH" --server letsencrypt -m "$EMAIL" || true
+    log "[${domain}] Add the TXT record(s) printed above in your DNS panel, wait a few"
+    log "[${domain}] minutes for them to propagate, then run: $0 continue ${domain}"
+    return 0
+  fi
+
+  acme --issue "${ISSUE_ARGS[@]}" "${args[@]}" --keylength "$KEY_LENGTH" --server letsencrypt -m "$EMAIL"
   cmd_export "$domain"   # export the files AND arm the after-renewal hook
+}
+
+# --- Second half of the manual-DNS flow, after the TXT record exists -----
+cmd_continue() {
+  local domain="$1"
+  check_docker
+  setup_validation
+  [[ "$VALIDATION" == "dns-manual" ]] || die "'continue' only applies to VALIDATION=dns-manual."
+
+  acme --renew -d "$domain" "${ECC[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please
+  cmd_export "$domain"
+  log "[${domain}] NOTE: manual DNS cannot auto-renew - repeat 'issue' + 'continue' before day 90."
 }
 
 # --- Export the files for the WAF + arm the renewal hook -----------------
@@ -224,6 +284,7 @@ read_file() { if [[ -r "$1" ]]; then cat "$1"; else sudo cat "$1"; fi; }
 cmd_renew() {
   local domain="$1"
   check_docker
+  setup_validation   # http mode needs port 80 published again; dns-api needs the creds
   acme --renew -d "$domain" "${ECC[@]}" --force
 }
 
@@ -253,11 +314,12 @@ run_all() {
   for d in "${DOMAINS[@]}"; do "$fn" "$d"; done
 }
 
-usage() { sed -n '3,22p' "$SELF" | sed 's/^# \?//'; exit "${1:-0}"; }
+usage() { sed -n '3,23p' "$SELF" | sed 's/^# \?//'; exit "${1:-0}"; }
 
 case "${1:-}" in
   install)     cmd_install ;;
   issue)       [[ -n "${2:-}" ]] && cmd_issue "$2"  || run_all cmd_issue ;;
+  continue)    cmd_continue "${2:?continue needs a domain}" ;;
   renew)       [[ -n "${2:-}" ]] && cmd_renew "$2"  || run_all cmd_renew ;;
   export)      [[ -n "${2:-}" ]] && cmd_export "$2" || run_all cmd_export ;;
   show)        [[ -n "${2:-}" ]] && cmd_show "$2"   || run_all cmd_show ;;
