@@ -87,6 +87,12 @@ else
   exit 1
 fi
 
+# The web service bind-mounts ./acme-challenge (Let's Encrypt HTTP-01 files, written
+# by ../script/waf_cert.sh). Create it here: if Docker has to create the missing
+# source directory itself it makes it root-owned, and waf_cert.sh can then no longer
+# write a challenge file into it without sudo.
+mkdir -p acme-challenge/.well-known/acme-challenge
+
 # ---------- Commands -----------------------------------------------------
 show_urls() {
   info "Site is up. Local check:  http://localhost/"

@@ -115,6 +115,22 @@ CRED_ENV=()      # -e flags forwarded to the container (values stay out of the p
 RUN_OPTS=()      # extra docker run options
 ISSUE_ARGS=()    # how acme.sh should validate
 
+# Prove a challenge file can actually be written, repairing ownership if it cannot.
+# Without this a root-owned WEBROOT surfaces later as a confusing "origin returns 404".
+ensure_webroot_writable() {
+  # subshells: a failing redirection is reported by the shell itself, so 2>/dev/null
+  # has to wrap the whole thing to keep a bare "Permission denied" out of the output
+  local probe="${WEBROOT}/.well-known/acme-challenge/.waf-write-test"
+  if ! ( : > "$probe" ) 2>/dev/null; then
+    log "Challenge directory is not writable - taking ownership (needs sudo)..."
+    sudo chown -R "$REAL_OWNER" "$WEBROOT" 2>/dev/null || true
+    ( : > "$probe" ) 2>/dev/null \
+      || die "cannot write to ${WEBROOT}/.well-known/acme-challenge
+       Fix it with: sudo chown -R ${REAL_OWNER} ${WEBROOT}"
+  fi
+  rm -f "$probe"
+}
+
 setup_validation() {
   # 'auto': DNS API if credentials are present, otherwise the no-credentials webroot path
   if [[ "$VALIDATION" == "auto" ]]; then
@@ -139,9 +155,13 @@ setup_validation() {
       ;;
     webroot)
       [[ -n "$WEBROOT" ]] || WEBROOT="$(dirname "$SELF")/../website/acme-challenge"
-      mkdir -p "${WEBROOT}/.well-known/acme-challenge" \
+      # Docker creates a missing bind-mount source as root, and an earlier 'sudo' run
+      # leaves it root-owned, so take ownership back instead of failing.
+      mkdir -p "${WEBROOT}/.well-known/acme-challenge" 2>/dev/null \
+        || sudo mkdir -p "${WEBROOT}/.well-known/acme-challenge" \
         || die "cannot create ${WEBROOT} - check the permissions on that directory."
       WEBROOT="$(cd "$WEBROOT" && pwd)"        # docker needs a clean absolute path
+      ensure_webroot_writable
       chmod -R 755 "$WEBROOT" 2>/dev/null || true   # nginx must be able to read the challenge file
       ISSUE_ARGS=(--webroot /webroot)
       RUN_OPTS=(-v "${WEBROOT}:/webroot")
@@ -176,20 +196,89 @@ check_docker() {
     || die "cannot talk to the Docker daemon - is it running, and is your user in the docker group? (or set DOCKER=\"sudo docker\")"
 }
 
-# --- webroot mode: make sure the origin nginx is up and serving /.well-known/ ---
+# --- Insert TEXT right after the first line containing PATTERN -----------------
+# awk rather than 'sed -i', whose in-place and 'r' syntax differ between GNU and BSD.
+# The text goes through the environment, not -v: awk rejects newlines in a -v value.
+insert_after() {
+  local file="$1" pattern="$2" tmp="$1.waf-cert-tmp"
+  WAF_INS="$3" awk -v pat="$pattern" '
+    { print }
+    !done && index($0, pat) { print ENVIRON["WAF_INS"]; done = 1 }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+  # under sudo the rewritten file would end up root-owned inside the git checkout
+  chown "$REAL_OWNER" "$file" 2>/dev/null || true
+}
+
+# --- Serve a token from WEBROOT and fetch it straight from the origin ----------
+# 127.0.0.1 deliberately: this proves the ORIGIN serves the challenge, with no DNS,
+# NAT or WAF in the way. A 404 here means Let's Encrypt would get a 404 too.
+verify_origin_local() {
+  local dir="${WEBROOT}/.well-known/acme-challenge"
+  mkdir -p "$dir"
+  ( printf 'ok' > "${dir}/waf-cert-selftest" ) 2>/dev/null || return 1
+  chmod 644 "${dir}/waf-cert-selftest" 2>/dev/null || true
+  local got=""
+  got="$(http_get "http://127.0.0.1/.well-known/acme-challenge/waf-cert-selftest" 2>/dev/null || true)"
+  rm -f "${dir}/waf-cert-selftest"
+  [[ "$got" == "ok" ]]
+}
+
+# --- webroot mode: make the origin nginx actually serve /.well-known/ ----------
 ensure_origin() {
   [[ "$VALIDATION" == "webroot" ]] || return 0
   local site_dir="$(dirname "$SELF")/../website"
   [[ -f "${site_dir}/docker-compose.yml" ]] || return 0
+  site_dir="$(cd "$site_dir" && pwd)"
 
   local compose
   if $DOCKER compose version >/dev/null 2>&1; then compose="$DOCKER compose"
   elif command -v docker-compose >/dev/null 2>&1;  then compose="docker-compose"
   else log "WARNING: docker compose not found - start the origin site yourself (website/setup.sh up)."; return 0; fi
 
-  log "Making sure the origin site is running with the challenge path mounted..."
+  # The vhost must have the challenge location, and the dir must be mounted in.
+  # Both are added if missing so an older checkout repairs itself.
+  local conf="${site_dir}/nginx/default.conf"
+  local yml="${site_dir}/docker-compose.yml"
+  if [[ -f "$conf" ]] && ! grep -q 'acme-challenge' "$conf"; then
+    log "Adding the ACME challenge location to nginx/default.conf..."
+    insert_after "$conf" 'server_name' '
+    # ACME HTTP-01 challenge for Lets Encrypt (added by ../script/waf_cert.sh).
+    # ^~ so it beats the SPA locations and is never rewritten to index.html.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type "text/plain";
+    }'
+  fi
+  if ! grep -q 'acme-challenge:/var/www/acme' "$yml"; then
+    log "Adding the challenge mount to docker-compose.yml..."
+    insert_after "$yml" '/etc/nginx/conf.d/default.conf' \
+      '      - ./acme-challenge:/var/www/acme:ro'
+  fi
+
+  log "Making sure the origin site serves the challenge path..."
   ( cd "$site_dir" && $compose up -d ) \
     || log "WARNING: could not start the origin site - run website/setup.sh up yourself."
+
+  if verify_origin_local; then
+    log "Origin self-test OK - nginx serves /.well-known/acme-challenge/."
+    return 0
+  fi
+
+  # 'up -d' leaves a running container alone, so an edited nginx conf is still
+  # the OLD config in memory. Force the web container to be rebuilt from scratch.
+  log "Origin did not serve the challenge yet - recreating the web container..."
+  ( cd "$site_dir" && $compose up -d --force-recreate web ) || true
+
+  if verify_origin_local; then
+    log "Origin self-test OK - nginx serves /.well-known/acme-challenge/."
+    return 0
+  fi
+
+  die "the origin still returns 404 for http://127.0.0.1/.well-known/acme-challenge/.
+       Let's Encrypt would get the same 404, so issuance was not attempted.
+       Check:  ${conf}      (needs a 'location ^~ /.well-known/acme-challenge/' block)
+               ${yml}       (web service needs '- ./acme-challenge:/var/www/acme:ro')
+       Then:   cd ${site_dir} && ${compose} up -d --force-recreate web"
 }
 
 # --- Fetch a URL using the host's curl, or the container's if the host has none ---
@@ -212,18 +301,23 @@ preflight() {
 
   [[ "$VALIDATION" == "webroot" ]] || return 0
 
+  # The origin itself was already proven by ensure_origin's 127.0.0.1 self-test, so a
+  # failure here is about the path from the internet, not about nginx. Many servers
+  # cannot reach their own public IP (no NAT hairpin), so this can only ever warn.
   local token="waf-cert-preflight" dir="${WEBROOT}/.well-known/acme-challenge"
-  mkdir -p "$dir"; printf 'ok' > "${dir}/${token}"; chmod 644 "${dir}/${token}"
+  mkdir -p "$dir"
+  ( printf 'ok' > "${dir}/${token}" ) 2>/dev/null || return 0
+  chmod 644 "${dir}/${token}" 2>/dev/null || true
   local got=""
   got="$(http_get "http://${domain}/.well-known/acme-challenge/${token}" 2>/dev/null || true)"
   rm -f "${dir}/${token}"
 
   if [[ "$got" == "ok" ]]; then
-    log "[${domain}] Pre-flight OK - the challenge path is reachable over plain HTTP."
+    log "[${domain}] Pre-flight OK - the challenge is reachable over the public name too."
   else
-    log "[${domain}] WARNING: could not fetch http://${domain}/.well-known/acme-challenge/${token} from this server."
-    log "[${domain}] Trying anyway. If it fails, the cause is one of: DNS not pointing here,"
-    log "[${domain}] port 80 blocked from the internet, or a WAF/proxy not forwarding /.well-known/."
+    log "[${domain}] Note: could not fetch the challenge via http://${domain}/ from this server."
+    log "[${domain}] That is normal when the server cannot reach its own public IP (no NAT"
+    log "[${domain}] hairpin). The origin self-test passed, so Let's Encrypt is likely fine."
   fi
 }
 
