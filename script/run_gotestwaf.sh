@@ -241,6 +241,12 @@ if [[ "$DO_PRECHECK" -eq 1 ]]; then
   if [[ "$big_code" == "ERR" || -z "$big_code" || "$big_code" == "000" ]]; then
     warn "Large POST dropped the connection. The 8kb-128kb test cases will fail"
     warn "the same way. Raise client_max_body_size / SecRequestBodyLimit first."
+  elif [[ "$big_code" =~ ^(404|405|501)$ ]]; then
+    # A method/path rejection happens BEFORE the body is read, so this proves
+    # nothing about the body limit - reporting it as "fine" is a false all-clear.
+    warn "Large POST returned ${big_code}: the endpoint rejected the METHOD or PATH, so"
+    warn "the body limit was never exercised. The 8kb-128kb cases may still fail with"
+    warn "'unexpected EOF'. Re-probe against a path that accepts POST (e.g. /api/)."
   else
     info "Large POST returned ${big_code} - body size looks fine"
   fi
