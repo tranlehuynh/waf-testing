@@ -2,6 +2,7 @@
 #
 # waf_cert.sh - Issue / renew Let's Encrypt certs (acme.sh in Docker) and export them for a WAF
 #
+#   ./waf_cert.sh setup                   EVERYTHING: install, issue every domain, print the certs
 #   ./waf_cert.sh install                 Pull the acme.sh image + start the auto-renew container
 #   ./waf_cert.sh issue  [domain]         Issue cert(s) for the first time (all, or one)
 #   ./waf_cert.sh continue <domain>       VALIDATION=dns-manual only: finish after adding the TXT record
@@ -38,17 +39,18 @@ declare -A EXTRA_SANS=(
 EMAIL="linhpn@vng.com.vn"            # must be a real address - Let's Encrypt rejects example.com
 
 # How Let's Encrypt verifies you own the domain. It never talks to your WAF - it only
-# checks the DOMAIN, so a custom/self-built WAF is fine. Pick whichever you can do:
+# checks the DOMAIN, so a custom/self-built WAF is fine.
 #
+#   auto        Use dns-api if DNS credentials are filled in below, otherwise webroot.
 #   dns-api     acme.sh adds the TXT record itself through your DNS host's API.
-#               Needs DNS_API + credentials below. Only mode with automatic renewal.
+#               Needs DNS_API + credentials below. Fully automatic.
 #   dns-manual  acme.sh prints a TXT record and you add it by hand in any DNS panel.
 #               Works with ANY DNS host, no API needed. You must repeat it every 90 days.
 #   webroot     Let's Encrypt fetches a file over plain HTTP port 80. No DNS credentials
 #               at all. acme.sh drops the file in WEBROOT and the origin nginx serves it,
 #               so port 80 is NOT taken over and the site keeps running. Renews
 #               automatically. Requires: http://<domain>/ reaches the origin nginx.
-VALIDATION="webroot"
+VALIDATION="auto"
 
 WEBROOT=""                           # VALIDATION=webroot only - host dir shared with the origin
                                      # nginx (see website/docker-compose.yml).
@@ -65,7 +67,17 @@ export CF_Account_ID=""
 # export AWS_ACCESS_KEY_ID=""
 # export AWS_SECRET_ACCESS_KEY=""
 
-OUT_BASE="${HOME}/waf-certs"         # must be an ABSOLUTE path (it is bind-mounted into the container)
+# Under sudo, $HOME is /root - resolve back to the invoking user so the certs do not
+# end up split between /root/waf-certs and /home/<user>/waf-certs.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  REAL_OWNER="${SUDO_UID}:${SUDO_GID}"
+else
+  REAL_HOME="$HOME"
+  REAL_OWNER="$(id -u):$(id -g)"
+fi
+
+OUT_BASE="${REAL_HOME}/waf-certs"    # must be an ABSOLUTE path (it is bind-mounted into the container)
                                      # per-domain files live in ${OUT_BASE}/<domain>
 KEY_LENGTH="ec-256"                  # ec-256 = ECDSA (acme.sh default); use 2048/4096 if the WAF wants RSA
 P12_PASS=""                          # password for the .p12 file, empty = no password
@@ -78,13 +90,24 @@ CONTAINER="waf-acme-renew"           # long-lived container that runs acme.sh's 
 # =======================================================
 
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-HOST_OWNER="$(id -u):$(id -g)"
+HOST_OWNER="$REAL_OWNER"
 
 # acme.sh needs --ecc on every command that touches an ECDSA cert
 if [[ "$KEY_LENGTH" == ec-* ]]; then ECC=(--ecc); else ECC=(); fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { echo "[$(date '+%F %T')] ERROR: $*" >&2; exit 1; }
+
+# A URL or a path here ends up as a bogus SAN and acme.sh fails deep inside openssl,
+# so reject anything that is not a bare hostname before it gets that far.
+check_domain() {
+  local d="$1"
+  case "$d" in
+    *://*|*/*|*:*|*\ *)
+      die "'$d' is not a domain name - pass just the hostname, e.g. superman.chubbyduck.org" ;;
+  esac
+  [[ "$d" == *.* ]] || die "'$d' does not look like a domain name (no dot in it)."
+}
 
 # --- Translate VALIDATION into acme.sh flags + docker run options ---------
 # Only 'issue'/'continue' need this; every other command reads state from the volume.
@@ -93,6 +116,16 @@ RUN_OPTS=()      # extra docker run options
 ISSUE_ARGS=()    # how acme.sh should validate
 
 setup_validation() {
+  # 'auto': DNS API if credentials are present, otherwise the no-credentials webroot path
+  if [[ "$VALIDATION" == "auto" ]]; then
+    if [[ -n "${CF_Token:-}" || ( -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ) ]]; then
+      VALIDATION="dns-api"
+    else
+      VALIDATION="webroot"
+    fi
+    log "VALIDATION=auto -> using '${VALIDATION}'."
+  fi
+
   case "$VALIDATION" in
     dns-api)
       case "$DNS_API" in
@@ -106,9 +139,10 @@ setup_validation() {
       ;;
     webroot)
       [[ -n "$WEBROOT" ]] || WEBROOT="$(dirname "$SELF")/../website/acme-challenge"
-      mkdir -p "${WEBROOT}/.well-known/acme-challenge"
+      mkdir -p "${WEBROOT}/.well-known/acme-challenge" \
+        || die "cannot create ${WEBROOT} - check the permissions on that directory."
       WEBROOT="$(cd "$WEBROOT" && pwd)"        # docker needs a clean absolute path
-      chmod -R 755 "$WEBROOT"                  # nginx must be able to read the challenge file
+      chmod -R 755 "$WEBROOT" 2>/dev/null || true   # nginx must be able to read the challenge file
       ISSUE_ARGS=(--webroot /webroot)
       RUN_OPTS=(-v "${WEBROOT}:/webroot")
       ;;
@@ -142,9 +176,60 @@ check_docker() {
     || die "cannot talk to the Docker daemon - is it running, and is your user in the docker group? (or set DOCKER=\"sudo docker\")"
 }
 
+# --- webroot mode: make sure the origin nginx is up and serving /.well-known/ ---
+ensure_origin() {
+  [[ "$VALIDATION" == "webroot" ]] || return 0
+  local site_dir="$(dirname "$SELF")/../website"
+  [[ -f "${site_dir}/docker-compose.yml" ]] || return 0
+
+  local compose
+  if $DOCKER compose version >/dev/null 2>&1; then compose="$DOCKER compose"
+  elif command -v docker-compose >/dev/null 2>&1;  then compose="docker-compose"
+  else log "WARNING: docker compose not found - start the origin site yourself (website/setup.sh up)."; return 0; fi
+
+  log "Making sure the origin site is running with the challenge path mounted..."
+  ( cd "$site_dir" && $compose up -d ) \
+    || log "WARNING: could not start the origin site - run website/setup.sh up yourself."
+}
+
+# --- Fetch a URL using the host's curl, or the container's if the host has none ---
+http_get() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 15 "$1"
+  else
+    $DOCKER run --rm --entrypoint curl "$IMAGE" -fsS --max-time 15 "$1"
+  fi
+}
+
+# --- Catch the usual causes of failure BEFORE burning a Let's Encrypt attempt ---
+# Never fatal: a server behind NAT may fail to reach its own public name even
+# though Let's Encrypt can, so this diagnoses rather than blocks.
+preflight() {
+  local domain="$1"
+
+  getent hosts "$domain" >/dev/null 2>&1 \
+    || log "[${domain}] WARNING: this name does not resolve from here yet - if DNS is not set up, issuance will fail."
+
+  [[ "$VALIDATION" == "webroot" ]] || return 0
+
+  local token="waf-cert-preflight" dir="${WEBROOT}/.well-known/acme-challenge"
+  mkdir -p "$dir"; printf 'ok' > "${dir}/${token}"; chmod 644 "${dir}/${token}"
+  local got=""
+  got="$(http_get "http://${domain}/.well-known/acme-challenge/${token}" 2>/dev/null || true)"
+  rm -f "${dir}/${token}"
+
+  if [[ "$got" == "ok" ]]; then
+    log "[${domain}] Pre-flight OK - the challenge path is reachable over plain HTTP."
+  else
+    log "[${domain}] WARNING: could not fetch http://${domain}/.well-known/acme-challenge/${token} from this server."
+    log "[${domain}] Trying anyway. If it fails, the cause is one of: DNS not pointing here,"
+    log "[${domain}] port 80 blocked from the internet, or a WAF/proxy not forwarding /.well-known/."
+  fi
+}
+
 # --- Run acme.sh in a throw-away container (state comes from the volume) --------
 acme() {
-  mkdir -p "$OUT_BASE"; chmod 700 "$OUT_BASE"
+  mkdir -p "$OUT_BASE"; chmod 700 "$OUT_BASE" 2>/dev/null || true
   $DOCKER run --rm "${RUN_OPTS[@]}" \
     -v "${VOLUME}:/acme.sh" \
     -v "${OUT_BASE}:/out" \
@@ -174,6 +259,8 @@ cmd_install() {
     -v "${OUT_BASE}:/out" \
     "$IMAGE" daemon >/dev/null
 
+  ensure_origin
+
   log "Done. State lives in volume '${VOLUME}', renewals run in container '${CONTAINER}'."
   if [[ "$VALIDATION" == "dns-manual" ]]; then
     log "VALIDATION=dns-manual: renewals are NOT automatic, you re-run issue/continue by hand."
@@ -181,9 +268,17 @@ cmd_install() {
   log "Next: $0 issue"
 }
 
+# --- One command that does the whole job ---------------------------------
+cmd_setup() {
+  cmd_install
+  run_all cmd_issue
+  run_all cmd_show
+}
+
 # --- Issue the certificate for one domain --------------------------------
 cmd_issue() {
   local domain="$1"
+  check_domain "$domain"
   check_docker
   setup_validation
   check_creds
@@ -203,13 +298,26 @@ cmd_issue() {
     return 0
   fi
 
-  acme --issue "${ISSUE_ARGS[@]}" "${args[@]}" --keylength "$KEY_LENGTH" --server letsencrypt -m "$EMAIL"
+  ensure_origin
+  preflight "$domain"
+
+  # acme.sh exits 2 ("skipped, cert is still valid") when re-run on a good cert, so
+  # treat that as success and just re-export - that makes 'issue' safe to re-run.
+  local rc=0
+  acme --issue "${ISSUE_ARGS[@]}" "${args[@]}" --keylength "$KEY_LENGTH" --server letsencrypt -m "$EMAIL" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) log "[${domain}] Certificate is still valid - skipping issuance, re-exporting the existing one." ;;
+    *) die "[${domain}] acme.sh failed (exit ${rc}). Nothing was exported - see the output above." ;;
+  esac
+
   cmd_export "$domain"   # export the files AND arm the after-renewal hook
 }
 
 # --- Second half of the manual-DNS flow, after the TXT record exists -----
 cmd_continue() {
   local domain="$1"
+  check_domain "$domain"
   check_docker
   setup_validation
   [[ "$VALIDATION" == "dns-manual" ]] || die "'continue' only applies to VALIDATION=dns-manual."
@@ -222,6 +330,7 @@ cmd_continue() {
 # --- Export the files for the WAF + arm the renewal hook -----------------
 cmd_export() {
   local domain="$1"
+  check_domain "$domain"
   local out_dir="${OUT_BASE}/${domain}"
   mkdir -p "$out_dir"; chmod 700 "$out_dir"
   write_p12_helper
@@ -278,7 +387,11 @@ EOF
 # --- Print to stdout for copy-pasting into the WAF UI --------------------
 cmd_show() {
   local domain="$1"
+  check_domain "$domain"
+  check_docker
   local out_dir="${OUT_BASE}/${domain}"
+  [[ -s "${out_dir}/fullchain.pem" ]] \
+    || die "no certificate for ${domain} in ${out_dir} yet - run: $0 issue ${domain}"
   echo "########## ${domain} ##########"
   echo "===== PRIVATE KEY (${out_dir}/privkey.pem) ====="
   read_file "${out_dir}/privkey.pem"
@@ -298,6 +411,7 @@ read_file() { if [[ -r "$1" ]]; then cat "$1"; else sudo cat "$1"; fi; }
 
 cmd_renew() {
   local domain="$1"
+  check_domain "$domain"
   check_docker
   setup_validation   # webroot mode needs its mount again; dns-api needs the creds
   check_creds
@@ -330,15 +444,24 @@ run_all() {
   for d in "${DOMAINS[@]}"; do "$fn" "$d"; done
 }
 
-usage() { sed -n '3,23p' "$SELF" | sed 's/^# \?//'; exit "${1:-0}"; }
+usage() { sed -n '3,24p' "$SELF" | sed 's/^# \?//'; exit "${1:-0}"; }
+
+# NOTE: 'cmd || run_all' would put the function in a tested context, which switches
+# OFF 'set -e' inside it - a failing acme.sh would then fall through to the export
+# step and report success for a cert that was never issued. Hence if/else.
+one_or_all() {
+  local fn="$1" arg="${2:-}"
+  if [[ -n "$arg" ]]; then "$fn" "$arg"; else run_all "$fn"; fi
+}
 
 case "${1:-}" in
+  setup)       cmd_setup ;;
   install)     cmd_install ;;
-  issue)       [[ -n "${2:-}" ]] && cmd_issue "$2"  || run_all cmd_issue ;;
+  issue)       one_or_all cmd_issue  "${2:-}" ;;
   continue)    cmd_continue "${2:?continue needs a domain}" ;;
-  renew)       [[ -n "${2:-}" ]] && cmd_renew "$2"  || run_all cmd_renew ;;
-  export)      [[ -n "${2:-}" ]] && cmd_export "$2" || run_all cmd_export ;;
-  show)        [[ -n "${2:-}" ]] && cmd_show "$2"   || run_all cmd_show ;;
+  renew)       one_or_all cmd_renew  "${2:-}" ;;
+  export)      one_or_all cmd_export "${2:-}" ;;
+  show)        one_or_all cmd_show   "${2:-}" ;;
   list)        printf '%s\n' "${DOMAINS[@]}" ;;
   status)      cmd_status ;;
   uninstall)   cmd_uninstall ;;

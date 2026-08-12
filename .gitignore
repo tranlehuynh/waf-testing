@@ -219,3 +219,6 @@ __marimo__/
 
 # Node (website/web React build)
 node_modules/
+
+# Let's Encrypt HTTP-01 challenge files (script/waf_cert.sh)
+website/acme-challenge/
