@@ -32,8 +32,7 @@ DOMAINS=("superman.chubbyduck.org")
 # Optional extra SANs per domain (wildcards / aliases), keyed by the domain above.
 # Leave an entry out for a plain single-name cert.
 declare -A EXTRA_SANS=(
-  # ["b.example.com"]="*.b.example.com"
-  # ["c.example.com"]="www.c.example.com"
+  ["superman.chubbyduck.org"]="www.superman.chubbyduck.org"
 )
 
 EMAIL="linhpn@vng.com.vn"            # must be a real address - Let's Encrypt rejects example.com
@@ -393,7 +392,10 @@ cmd_issue() {
   fi
 
   ensure_origin
+  # Every name on the cert is validated separately - one unreachable SAN fails the
+  # whole order, so check them all, not just the primary.
   preflight "$domain"
+  for d in $extra; do if [[ -n "$d" ]]; then preflight "$d"; fi; done
 
   # acme.sh exits 2 ("skipped, cert is still valid") when re-run on a good cert, so
   # treat that as success and just re-export - that makes 'issue' safe to re-run.
