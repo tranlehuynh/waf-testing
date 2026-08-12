@@ -88,12 +88,58 @@ if [[ ! "$TARGET_URL" =~ ^https?:// ]]; then
     if curl -sk -o /dev/null --max-time 8 "${scheme}://${TARGET_URL}" 2>/dev/null; then
       TARGET_URL="${scheme}://${TARGET_URL}"
       info "Reachable over ${scheme} - using ${TARGET_URL}"
+      # Falling back to http when https refused the connection is exactly what an
+      # origin behind a TLS-terminating WAF looks like from the inside.
+      if [[ "$scheme" == "http" ]]; then
+        warn "https did not answer, so this scan will run over plain HTTP."
+        warn "If the WAF terminates TLS, plain HTTP usually reaches the ORIGIN, not the WAF."
+      fi
       break
     fi
   done
   [[ "$TARGET_URL" =~ ^https?:// ]] || { err "Neither http nor https answered. Pass --url with an explicit scheme."; exit 1; }
 fi
 TARGET_URL="${TARGET_URL%/}"
+
+# ---------- 1b. Make the address being scanned explicit -------------------
+# A target that resolves to this machine means the traffic never traverses the
+# WAF - it lands on the permissive origin nginx and scores a meaningless ~0%.
+check_target_address() {
+  local host="${TARGET_URL#*://}"
+  host="${host%%/*}"          # drop any path
+  host="${host%%:*}"          # drop any :port
+
+  local addrs
+  addrs="$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+  addrs="${addrs%% }"
+  if [[ -z "$addrs" ]]; then
+    err "${host} does not resolve from this machine - GoTestWAF cannot reach it."
+    exit 1
+  fi
+  info "Target resolves to: ${addrs}"
+
+  local local_addrs="127.0.0.1 ::1"
+  if command -v ip &>/dev/null; then
+    local_addrs+=" $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+  fi
+
+  local a b
+  for a in $addrs; do
+    for b in $local_addrs; do
+      [[ "$a" == "$b" ]] || continue
+      echo
+      warn "${host} resolves to ${a}, which is an address of THIS machine."
+      warn "The scan would hit the origin nginx directly and never traverse the WAF,"
+      warn "so the score would describe the origin - which is deliberately permissive -"
+      warn "and not your WAF. Point the scan at the WAF, or fix DNS on this host."
+      echo
+      read -rp "Continue anyway? [y/N] " ans
+      [[ "${ans:-N}" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
+      return 0
+    done
+  done
+}
+check_target_address
 
 # ---------- 2. Install Docker if missing (Ubuntu) ------------------------
 hr; info "[1/6] Checking the Docker environment"; hr
