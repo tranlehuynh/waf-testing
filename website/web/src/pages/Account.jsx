@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { register, login, me, logout, getToken } from "../lib/auth.js";
+import { register, login, me, logout, getToken } from "../auth.js";
 
 // A real (if deliberately unhardened) account page: register and log in against the
 // Flask API, which mints a signed bearer token. Once logged in it shows the token and

@@ -248,7 +248,7 @@ web/     React app (Vite) + Dockerfile — compiled into the `site` volume for n
   src/App.jsx           shell + route switch
   src/router.jsx        ~30-line router (no routing library)
   src/styles.css        design tokens + all styles
-  src/lib/auth.js       client auth helpers (token storage, fetch wrappers)
+  src/auth.js           client auth helpers (token storage, fetch wrappers)
   src/pages/Home.jsx    landing page (no API calls)
   src/pages/Rules.jsx   house rules + the two API targets
   src/pages/Account.jsx register / login / session token (the XSS-theft target)
