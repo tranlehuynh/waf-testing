@@ -223,7 +223,13 @@ def h_nosql(payload):
     except ValueError:
         query = None
     if not isinstance(query, dict):
-        query = {"$where": payload}
+        # GoTestWAF's fragments arrive as an object tail, e.g. `true, $where: '99 == 88'`:
+        # they model input concatenated into a query object, so an extra $where operator
+        # rides along. Pull that JS predicate out and run just it - what Mongo does with
+        # the reconstructed object - instead of feeding the whole malformed fragment to
+        # $where (which only errors). A bare predicate with no `$where:` key runs as-is.
+        embedded = re.search(r"\$where\s*:\s*(['\"])(.*?)\1", payload, re.S)
+        query = {"$where": embedded.group(2) if embedded else payload}
 
     coll = _mongo_collection()
     if coll is not None:
