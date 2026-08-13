@@ -182,8 +182,15 @@ def _mongo_collection():
         import pymongo
         client = pymongo.MongoClient(url, serverSelectionTimeoutMS=800)
         coll = client["lab"]["players"]
+        # A unique index makes the lazy seed safe under the four gunicorn workers: the
+        # first writer wins, and a racing worker's duplicate rows are rejected one by one
+        # (ordered=False) instead of doubling the collection.
+        coll.create_index("username", unique=True)
         if coll.estimated_document_count() == 0:
-            coll.insert_many([dict(entry) for entry in seed.DIRECTORY])
+            try:
+                coll.insert_many([dict(p) for p in seed.PLAYERS], ordered=False)
+            except Exception:
+                pass
         return coll
     except Exception:
         return None
@@ -232,9 +239,9 @@ def h_nosql(payload):
     if "$where" in query:
         return ("mongo unavailable; $where server-side JS needs the mongo sidecar.\n"
                 f"detected $where: {query['$where'][:200]}")
-    hits = [dict(entry) for entry in seed.DIRECTORY if _match_in_memory(entry, query)]
+    hits = [dict(p) for p in seed.PLAYERS if _match_in_memory(p, query)]
     return (f"query: {json.dumps(query)[:400]}\n"
-            f"documents_returned: {len(hits)} (of {len(seed.DIRECTORY)})\n"
+            f"documents_returned: {len(hits)} (of {len(seed.PLAYERS)})\n"
             + "\n".join(json.dumps(h) for h in hits))
 
 
@@ -350,6 +357,16 @@ def run_category():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "sink"}), 200
+
+
+# Warm the Mongo players collection at import time (best-effort, runs once in the
+# --preload master) so `mongosh` shows the accounts even before the first NoSQL request.
+# If Mongo is not accepting connections yet, this fails fast and the lazy seed in
+# _mongo_collection populates it on the first real request instead.
+try:
+    _mongo_collection()
+except Exception:
+    pass
 
 
 if __name__ == "__main__":

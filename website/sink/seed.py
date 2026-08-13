@@ -39,7 +39,11 @@ _FAKE_DBCONF = (
     "note = FAKE lab data - this credential opens nothing real\n"
 )
 
-# In-memory fake directory / documents, reused by the LDAP and NoSQL sinks.
+# Poker accounts for the Mongo-backed NoSQL sink, filled in by build(). Kept as a module
+# global so sink_app can seed Mongo from it (and fall back to it when Mongo is down).
+PLAYERS = []
+
+# In-memory fake directory / documents, reused by the LDAP sink.
 DIRECTORY = [
     {"dn": "cn=admin,dc=poker,dc=local", "uid": "admin", "objectclass": "person",
      "userpassword": "f4ke-admin-pw", "role": "admin"},
@@ -83,6 +87,33 @@ def build():
         con.execute("INSERT INTO players VALUES (?,?,?,?)", (i, handle, chips, pw))
     con.commit()
     con.close()
+
+    # Poker accounts for the Mongo NoSQL sink. Deliberately juicy - password hashes,
+    # emails, balances, and one admin carrying an API key - so a successful `$ne` / `$where`
+    # injection visibly DUMPS rows instead of just returning 200. Every value is randomly
+    # seeded and worthless. Generated last so the SQLite stream above is byte-for-byte
+    # unchanged; read by sink_app._mongo_collection.
+    global PLAYERS
+    PLAYERS = []
+    for i, handle in enumerate(_HANDLES, start=1):
+        pw = "$2b$12$" + "".join(random.choice(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./")
+            for _ in range(53))
+        PLAYERS.append({
+            "id": i,
+            "username": handle,
+            "email": "%s@fridaynightpoker.local" % handle,
+            "password_bcrypt": pw,
+            "chips": random.randrange(100, 200000),
+            "role": "player",
+            "vip": random.random() < 0.3,
+        })
+    # The planted admin: the account an authentication-bypass injection is really after.
+    PLAYERS[0].update(
+        role="admin", chips=999999, vip=True,
+        api_key="fnp_live_" + "".join(random.choice("0123456789abcdef") for _ in range(24)),
+        note="FAKE seed data - this account and key open nothing real",
+    )
     return DB_PATH
 
 
