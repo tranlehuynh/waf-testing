@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py sinks.py ./
+COPY app.py sinks.py auth.py ./
 
 EXPOSE 5000
 

@@ -28,11 +28,18 @@ services:
       # Set to your own collaborator domain suffix (e.g. "abc123.oast.me") to enable the
       # real Log4Shell OOB callback. Empty = detect + log JNDI, but make no outbound call.
       JNDI_CALLBACK_ALLOW: ""
+      # Accounts + bearer-token sessions live in the lab Mongo (api is on the detonation
+      # network, so it can reach it). JWT_SECRET signs the session token - override it.
+      MONGO_URL: "mongodb://mongo:27017"
+      JWT_SECRET: "dev-not-secret-change-me"
     networks:
       - edge
       - detonation
     depends_on:
-      - sink
+      sink:
+        condition: service_started
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
     logging: *logging
 
@@ -92,7 +99,8 @@ services:
     pids_limit: 128
     mem_limit: 512m
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
     logging: *logging
 
@@ -108,6 +116,15 @@ services:
       - /data/db
     security_opt:
       - no-new-privileges:true
+    # api and sink seed their collections (users, players) at startup, so they must not
+    # start until Mongo actually accepts connections - a plain `depends_on` only waits for
+    # the container to start, not for the database to be ready. This healthcheck gates them.
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
     logging: *logging
 

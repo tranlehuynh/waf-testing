@@ -3,6 +3,7 @@ import Nav from "./components/Nav.jsx";
 import Footer from "./components/Footer.jsx";
 import Home from "./pages/Home.jsx";
 import Rules from "./pages/Rules.jsx";
+import Account from "./pages/Account.jsx";
 import NotFound from "./pages/NotFound.jsx";
 
 // Keep this list in step with the exact-match locations in nginx/default.conf,
@@ -10,6 +11,7 @@ import NotFound from "./pages/NotFound.jsx";
 const ROUTES = {
   "/": Home,
   "/rules": Rules,
+  "/account": Account,
 };
 
 export default function App() {

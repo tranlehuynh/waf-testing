@@ -9,8 +9,6 @@ Helper scripts and a demo origin site for working with a WAF-fronted domain:
 | [`website/`](website/) | A demo poker site (nginx + Flask API) to run **behind your WAF** as the origin/target for GoTestWAF. See [`website/README.md`](website/README.md). |
 | [`docs/waf-test-report.md`](docs/waf-test-report.md) | Findings report for the scan of `superman.chubbyduck.org` — corrected scores, bypasses by attack class, and the remediation asks for the WAF operator. |
 
-Detailed reference: [`docs/WAF.md`](docs/WAF.md).
-
 ### Layout
 
 ```
@@ -18,7 +16,7 @@ script/
   run_gotestwaf.sh   GoTestWAF scan wrapper (Docker)
   waf_cert.sh        acme.sh / Let's Encrypt cert issuer + exporter
 website/             demo origin site (nginx + Flask), see its own README
-docs/WAF.md          detailed reference for both scripts
+docs/                waf-test-report.md — worked analysis of a real scan
 ```
 
 ---
@@ -77,12 +75,34 @@ A URL without a scheme gets `https://` prepended; a trailing slash is stripped.
 > (i.e. with `--strict`), GoTestWAF scores any response matching *neither* list as
 > "blocked", which silently drives the false-positive score to 0%. Use `--strict` only
 > when you deliberately want that stricter behaviour.
+>
+> `--nonBlockedAsPassed` cuts the other way too: an unlisted status (e.g. a `405` to a
+> body-borne request) is folded into *passed* for attack payloads and *blocked* for benign
+> ones, while the summary still prints `unresolved: 0` — so the report fills with bypasses
+> and false positives the WAF never caused. The pre-flight check probes every placeholder
+> shape for exactly this reason; don't skip it.
+
+### Confirming a bypass is real
+
+GoTestWAF's verdict is only the status code: a `200` means "the WAF let it through", not
+"the attack worked". The bundled origin ([`website/`](website/)) closes that gap — for a
+recognised payload it **actually executes** the attack against fake data (real shell, SQLite,
+Jinja2, file read, XML entities, and a Mongo `$where`) and returns the real result in the
+response's `attack` block, while still answering `200` so the score is unchanged. So a row
+marked *bypassed* can be reproduced against the origin to see the concrete impact. The
+execution is contained: it runs in a separate, non-root, **no-egress** `sink` container on an
+`internal: true` network and touches only fake data. See
+[`website/README.md`](website/README.md#real-attack-surface-detonation-chamber) for the sink
+details, the `JNDI_CALLBACK_ALLOW` switch for Log4Shell, and the recommended step of
+firewalling the origin to your WAF's egress IPs.
 
 ### Output
 
-HTML + JSON reports are written to `reports/<timestamp>/` **relative to your current
-directory**, not to `script/` — so run it from the repo root to collect reports in
-`./reports/`. The script prints the file list when it finishes.
+HTML + JSON reports — plus CSV on gotestwaf images that still emit it (the script asks the
+image and drops the format if unsupported) — are written to `reports/<timestamp>/`
+**relative to your current directory**, not to `script/`, so run it from the repo root to
+collect reports in `./reports/`. The script prints the file list when it finishes. A worked
+analysis of a real scan is in [`docs/waf-test-report.md`](docs/waf-test-report.md).
 
 ---
 

@@ -14,6 +14,9 @@ export default function Nav({ path }) {
         <Link to="/rules" className={path === "/rules" ? "active" : ""}>
           House rules
         </Link>
+        <Link to="/account" className={path === "/account" ? "active" : ""}>
+          Account
+        </Link>
       </nav>
     </header>
   );

@@ -222,3 +222,11 @@ node_modules/
 
 # Let's Encrypt HTTP-01 challenge files (script/waf_cert.sh)
 website/acme-challenge/
+
+# macOS
+.DS_Store
+
+# GoTestWAF scan artifacts (kept out of the repo; they belong in reports/)
+reports/
+script/reports/
+waf-evaluation-report-*.html

@@ -24,6 +24,7 @@ from html import escape
 
 from flask import Flask, Response, g, jsonify, request
 
+import auth
 from sinks import classify, detonate
 
 app = Flask(__name__)
@@ -33,7 +34,7 @@ app = Flask(__name__)
 # Bumped whenever this file or sinks.py changes. Returned as X-Origin-Build and by
 # /api/health so a scan can prove in one request that server A is running current
 # code - an undeployed origin silently voided ~40% of two earlier scans.
-BUILD = "real-2"
+BUILD = "real-5"
 
 ALL_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
 
@@ -225,9 +226,53 @@ def games():
     return echo("games")
 
 
-@app.route("/api/login", methods=ALL_METHODS)
-def login():
-    return echo("login")
+# ---- Real accounts + bearer-token sessions (see auth.py) ----------------
+# These are genuine: register/login persist a user in the lab Mongo and mint a signed
+# token, so a token stolen via XSS actually owns the account at /api/me. They answer 200
+# with an {"ok": bool} body rather than 401/409, keeping the origin's "every response is a
+# scoreable 200" invariant intact - the SPA branches on `ok`, not the status code.
+def _bearer():
+    """The session token from the Authorization header or the JS-readable `token` cookie."""
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:].strip()
+    return request.cookies.get("token", "")
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data = request.get_json(silent=True) or {}
+    return jsonify(auth.register((data.get("username") or "").strip(),
+                                 data.get("password") or "")), 200
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    result = auth.login((data.get("username") or "").strip(), data.get("password") or "")
+    response = jsonify(result)
+    if result.get("ok"):
+        # JS-readable ON PURPOSE: this cookie is the document.cookie theft target for the
+        # XSS demo. `token_httponly` carries the same value but is hidden from JS - the
+        # contrast that shows HttpOnly is the real fix. No Secure flag so it also works on
+        # plain-HTTP localhost / behind a TLS-terminating WAF.
+        response.set_cookie("token", result["token"], path="/", samesite="Lax")
+        response.set_cookie("token_httponly", result["token"], path="/",
+                            samesite="Lax", httponly=True)
+    return response, 200
+
+
+@app.route("/api/me", methods=ALL_METHODS)
+def api_me():
+    return jsonify(auth.whoami(_bearer())), 200
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    response = jsonify({"ok": True})
+    response.delete_cookie("token", path="/")
+    response.delete_cookie("token_httponly", path="/")
+    return response, 200
 
 
 @app.route("/api/health", methods=ALL_METHODS)
@@ -240,6 +285,11 @@ def health():
 # deliberate, isolated exception to the JSON/nosniff response policy - the real site
 # pages (React, auto-escaping) never do this. GoTestWAF scores on status alone, so this
 # does not change any score; it exists purely for manual confirmation.
+#
+# The `session` cookie set in _label above rides on the same response, so a payload here
+# that reads document.cookie (e.g. the report's `document["cookie"]`) steals a live session
+# id - and NOT `session_secure`, which is HttpOnly. Opening this URL in a browser is the
+# Level 2 cookie-theft demo, self-contained: the cookie is issued and stolen in one hit.
 @app.route("/api/sink/xss", methods=ALL_METHODS)
 def sink_xss():
     q = request.values.get("q", "")
@@ -273,6 +323,13 @@ def site_catch_all(subpath=""):
 @app.errorhandler(405)
 def unmatched(_error):
     return echo("unmatched")
+
+
+# Create the demo accounts at import time so a fresh `setup.sh up` is login-ready. Runs once
+# per gunicorn worker; idempotent (see seed_users). Mongo is guaranteed reachable because the
+# api service waits on the mongo healthcheck (docker-compose.yml). Best-effort: if the store
+# is briefly unavailable it just no-ops, and register/login still work once it is back.
+auth.seed_users()
 
 
 if __name__ == "__main__":

