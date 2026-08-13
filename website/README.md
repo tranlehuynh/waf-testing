@@ -51,11 +51,16 @@ a route the app knows about to the API instead of serving the app shell.
 ./setup.sh down       # stop
 ```
 
-The React app is compiled by Vite **inside the web image** (`web/Dockerfile`, a
-`node:20-alpine` build stage feeding `nginx:alpine`), so nothing needs installing on the
-host — but the build does need `registry.npmjs.org` reachable. Because the assets are
-baked into the image, edits to `web/` require `./setup.sh restart` (a rebuild), not just
-a container bounce.
+Serving is split across two containers. `web` (`web/Dockerfile`, `node:20-alpine`)
+compiles the React app with Vite at **image-build** time, then on start copies the output
+into the `site` volume and exits; `nginx` is the stock `nginx:alpine` image and serves
+that volume. So nothing needs installing on the host — but the build does need
+`registry.npmjs.org` reachable. Two consequences:
+
+- editing `web/` requires `./setup.sh restart` (a rebuild), not just a container bounce —
+  the compiled assets live in the `web` image;
+- editing `nginx/default.conf` only needs `docker compose restart nginx`, since the config
+  is bind-mounted.
 
 Then check locally:
 
@@ -64,7 +69,7 @@ curl -s http://localhost/       | grep -o '<div id="root">'   # app shell
 curl -so /dev/null -w '%{http_code}\n' http://localhost/rules # 200 — a real route
 curl -so /dev/null -w '%{http_code}\n' http://localhost/nope  # 200 — handed to the API
 curl -so /dev/null -w '%{http_code}\n' -X POST -d a=1 http://localhost/  # 200 — body read
-curl -s http://localhost/api/health                           # {"status":"ok","build":"real-1"}
+curl -s http://localhost/api/health                           # {"status":"ok","build":"real-2"}
 curl -s 'http://localhost/api/reports/download?file=../../../../etc/passwd'  # REAL file read (sink container)
 ```
 
@@ -138,11 +143,22 @@ and for targeted scans (`--url https://your-domain/api/players/search`):
 | `/api/import/feed` | XML body | XXE / XML injection |
 
 Every request also writes one JSON line to stdout with the payload, the classified
-category and a request id, which is what proves a payload reached the application:
+category, a request id, and the detonation verdict — `attack_executed` plus a 200-char
+`attack_result` digest. Those last two are what separate *arrived* from *ran*: the full
+exploitation output goes back in the HTTP response, and GoTestWAF reads the status code
+and discards the body, so the log is the only place the proof survives a scan.
 
 ```bash
 docker compose logs --no-color api | grep '^{' > evidence.jsonl
+
+# every payload that got through the WAF *and* really executed
+jq -c 'select(.attack_executed) | {rid, category, surface, attack_result}' evidence.jsonl
 ```
+
+Each line also carries GoTestWAF's own test tag under `.headers` (the `X-Gotestwaf-Test`
+header, added by `--addDebugHeader`, which `../script/run_gotestwaf.sh` passes by default).
+That tag is the join key from a line here to a row of the scan's CSV report, so a
+"bypassed" row can be tied to the payload that arrived and what it did on the origin.
 
 One behavioural note: the app reads the raw request body before Flask parses it, so a
 form-encoded body appears in the echo as the raw string rather than a parsed dict.
@@ -159,7 +175,7 @@ curl -s -X DELETE http://localhost/api/tables/42
 ## Layout
 
 ```
-web/     React app (Vite) + Dockerfile — built, then served by nginx
+web/     React app (Vite) + Dockerfile — compiled into the `site` volume for nginx
   index.html            Vite entry
   src/App.jsx           shell + route switch
   src/router.jsx         ~30-line router (no routing library for two pages)
@@ -172,7 +188,9 @@ api/     Flask app + Dockerfile (the API backend / orchestrator)
 sink/    Detonation chamber + Dockerfile — the real, contained vulnerable backends
   sink_app.py           per-category handlers that actually execute the payload
   seed.py               fake, randomly-seeded data (players DB, files, directory)
-nginx/   default.conf — serves the built app, proxies /api/ to the api service
-docker-compose.yml   web + api (edge) · sink + mongo (detonation, internal:true, no egress)
+nginx/   default.conf — bind-mounted into the stock nginx:alpine container; serves the
+         built app from the `site` volume and proxies /api/ to the api service
+docker-compose.yml   nginx + web (build-only) + api (edge) · sink + mongo
+                     (detonation, internal:true, no egress)
 setup.sh             install Docker + run/maintain the stack
 ```

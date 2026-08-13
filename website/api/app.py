@@ -33,7 +33,7 @@ app = Flask(__name__)
 # Bumped whenever this file or sinks.py changes. Returned as X-Origin-Build and by
 # /api/health so a scan can prove in one request that server A is running current
 # code - an undeployed origin silently voided ~40% of two earlier scans.
-BUILD = "real-1"
+BUILD = "real-2"
 
 ALL_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
 
@@ -135,6 +135,17 @@ def _label(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Cache-Control"] = "no-store"
 
+    # The detonation verdict, from echo() below. It matters in the log and not only in the
+    # response body, because that body is the one artefact nobody keeps: GoTestWAF reads
+    # the status code and discards it. Without these two fields the log proves a payload
+    # ARRIVED; with them it proves the payload RAN - the difference between "the WAF
+    # returned 200" and "this bypass executed a command on the origin".
+    attack = g.get("attack") or {}
+    # A digest, not the full output: a 4 KB /etc/passwd read would push the line past
+    # LINE_MAX and cost the body evidence that _emit trims to make room. The complete
+    # result is in the response the scanner received.
+    attack_result = (attack.get("result") or attack.get("error") or "")[:200] or None
+
     raw_bytes = g.get("raw_bytes", b"")
     _emit({
         "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -152,6 +163,8 @@ def _label(response):
         "body": g.get("raw_body", "")[:1024],
         "category": found[0] if found else None,
         "surface": found[1] if found else None,
+        "attack_executed": bool(attack.get("executed")),
+        "attack_result": attack_result,
         "status": response.status_code,
         "build": BUILD,
     })
@@ -179,6 +192,7 @@ def echo(resource):
             # most likely to paste into HTML. The raw bytes stay in the evidence log.
             matched=escape(snippet),
         )
+        g.attack = attack      # _label logs the verdict; see the comment there
 
     return jsonify({
         "resource": resource,

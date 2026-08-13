@@ -264,9 +264,9 @@ ensure_origin() {
   fi
 
   # 'up -d' leaves a running container alone, so an edited nginx conf is still
-  # the OLD config in memory. Force the web container to be rebuilt from scratch.
-  log "Origin did not serve the challenge yet - recreating the web container..."
-  ( cd "$site_dir" && $compose up -d --force-recreate web ) || true
+  # the OLD config in memory. Force the nginx container to be rebuilt from scratch.
+  log "Origin did not serve the challenge yet - recreating the nginx container..."
+  ( cd "$site_dir" && $compose up -d --force-recreate nginx ) || true
 
   if verify_origin_local; then
     log "Origin self-test OK - nginx serves /.well-known/acme-challenge/."
@@ -276,8 +276,8 @@ ensure_origin() {
   die "the origin still returns 404 for http://127.0.0.1/.well-known/acme-challenge/.
        Let's Encrypt would get the same 404, so issuance was not attempted.
        Check:  ${conf}      (needs a 'location ^~ /.well-known/acme-challenge/' block)
-               ${yml}       (web service needs '- ./acme-challenge:/var/www/acme:ro')
-       Then:   cd ${site_dir} && ${compose} up -d --force-recreate web"
+               ${yml}       (nginx service needs '- ./acme-challenge:/var/www/acme:ro')
+       Then:   cd ${site_dir} && ${compose} up -d --force-recreate nginx"
 }
 
 # --- Fetch a URL using the host's curl, or the container's if the host has none ---

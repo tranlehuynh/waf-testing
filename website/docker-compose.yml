@@ -36,15 +36,37 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Build-only container: it publishes the compiled React assets into the `site` volume
+  # and exits. It serves nothing and needs no network (`none`, so no stray default
+  # network is created). The old dist is cleared first, or renamed-away asset hashes from
+  # a previous build would accumulate in the volume forever.
   web:
-    build: ./web        # builds the React app, then serves it with nginx
+    build: ./web
+    command: sh -c "rm -rf /site/* && cp -a /app/dist/. /site/"
+    volumes:
+      - site:/site
+    network_mode: none
+    restart: "no"       # a one-shot copy; restarting it would just redo the same copy
+
+  # The public face of the origin: the official nginx image, unmodified. It serves the
+  # assets `web` left in the volume and proxies /api/ to the api service. Both the config
+  # and the challenge dir are bind-mounted, so an nginx-only change needs just
+  # `docker compose restart nginx` - no image rebuild.
+  nginx:
+    image: nginx:alpine
     ports:
       - "80:80"         # the origin port your WAF forwards to
     volumes:
+      - site:/usr/share/nginx/html:ro
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./acme-challenge:/var/www/acme:ro   # Let's Encrypt challenge files (../script/waf_cert.sh)
     depends_on:
-      - api
+      # Waiting for the copy to finish is what keeps nginx from serving an empty docroot
+      # on a first start; `api` only has to be started, since nginx proxies to it lazily.
+      web:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
     networks:
       - edge
     restart: unless-stopped
@@ -88,3 +110,8 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     logging: *logging
+
+# The compiled React assets: written by `web` on every start, served read-only by nginx.
+# A named volume rather than a bind mount, so the build output never lands on the host.
+volumes:
+  site:
