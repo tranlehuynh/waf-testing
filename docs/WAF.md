@@ -50,7 +50,8 @@ for attack payloads and into *blocked* for benign ones, and the summary still pr
 full of bypasses and false positives that the WAF never caused. The pre-flight check
 probes every placeholder shape for exactly this reason — do not skip it.
 
-Reports are written to `reports/<timestamp>/` as HTML + JSON + CSV. A worked analysis of a
+Reports are written to `reports/<timestamp>/` as HTML + JSON, plus CSV on gotestwaf images
+that still support that format (the script asks the image and drops it if not). A worked analysis of a
 real scan, including how to correct for the above, is in
 [`waf-test-report.md`](waf-test-report.md).
 

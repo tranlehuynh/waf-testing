@@ -209,6 +209,21 @@ done
 [[ "$CONN_RESET_BLOCKED" -eq 1 ]] && add_if_supported --blockConnReset
 [[ "$STRICT" -eq 0 ]] && add_if_supported --nonBlockedAsPassed
 
+# Report formats need the same treatment, and more urgently: an unsupported value is
+# rejected at flag-parse time, so the run dies at [5/6] with "unknown report format: csv"
+# AFTER the whole pre-flight and the confirmation prompt. This image is pulled from
+# :latest on every run and its flag set moves - an earlier scan here produced a .csv,
+# then csv was dropped from gotestwaf. html and json have always been supported, so ask
+# only about the optional one and fail safe by leaving it out.
+REPORT_FORMATS="html,json"
+if grep -A3 -- '-reportFormat' <<<"$HELP_TEXT" | grep -qiw csv; then
+  REPORT_FORMATS+=",csv"
+else
+  warn "This gotestwaf image has no 'csv' report format - requesting ${REPORT_FORMATS}"
+  warn "The .csv (one row per payload x placeholder x encoder) referenced in docs/ came"
+  warn "from an older image; the .json report carries the same per-test rows."
+fi
+
 # ---------- 5. Sanity-check the target ----------------------------------
 if [[ "$DO_PRECHECK" -eq 1 ]]; then
   hr; info "[4/6] Pre-flight check on the target"; hr
@@ -371,7 +386,7 @@ DOCKER_ARGS=(
   --workers="$WORKERS"
   --maxIdleConns="$IDLE_CONNS"
   "${OPTIONAL_FLAGS[@]}"
-  --reportFormat=html,json,csv
+  --reportFormat="$REPORT_FORMATS"
   --reportPath=/app/reports
 )
 

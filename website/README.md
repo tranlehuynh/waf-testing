@@ -157,7 +157,8 @@ jq -c 'select(.attack_executed) | {rid, category, surface, attack_result}' evide
 
 Each line also carries GoTestWAF's own test tag under `.headers` (the `X-Gotestwaf-Test`
 header, added by `--addDebugHeader`, which `../script/run_gotestwaf.sh` passes by default).
-That tag is the join key from a line here to a row of the scan's CSV report, so a
+That tag is the join key from a line here to a per-test row of the scan's report (the
+`.json` artifact, and the `.csv` too if the gotestwaf image still emits one), so a
 "bypassed" row can be tied to the payload that arrived and what it did on the origin.
 
 One behavioural note: the app reads the raw request body before Flask parses it, so a
